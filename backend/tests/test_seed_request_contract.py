@@ -222,3 +222,116 @@ def test_smart_intent_preserves_only_user_supplied_model_as_explicit():
 
     assert automatic.model_preference is None
     assert explicit.model_preference == "user-selected-model"
+
+
+def test_auto_seeds_enabled_executes_planned_candidate_count():
+    seed_plan = resolve_seed_plan(
+        {"candidate_count": None, "plan": {"num_seeds": 3}},
+        {"seed": 10},
+        seeds_cfg={"base_seed": 41, "seed_step": 5, "max_candidates": 4},
+        apply_cfg={"auto_seeds": True},
+    )
+
+    assert seed_plan["candidate_count"] == 3
+    assert seed_plan["auto_seeds_enabled"] is True
+    assert seed_plan["seed_schedule"] == [10, 15, 20]
+
+
+def test_rate_limit_disabled_allows_arbitrary_requests():
+    import asyncio
+    from unittest.mock import MagicMock
+    from api.dependencies import _rate_limit_result
+
+    request = MagicMock()
+    request.state = MagicMock()
+    request.state._formash_rate_limit_result = None
+
+    settings = MagicMock()
+    settings.security.rate_limit_enabled = False
+    settings.security.rate_limit_per_minute = 0
+
+    result = asyncio.run(_rate_limit_result(request, settings))
+    assert result["allowed"] is True
+    assert result["limit"] == 0
+
+
+def test_multi_gpu_load_sharing_accepts_candidate_when_single_gpu_is_insufficient():
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 2,
+        "installed_adapters": ["trellis2_image_to_raw_mesh"],
+        "enabled_adapters": ["trellis2_image_to_raw_mesh"],
+        "free_vram_gb": 14.36,
+        "max_free_vram_gb": 14.36,
+        "aggregate_free_vram_gb": 28.72,
+    }
+    plan = plan_generation(
+        {"model_preference": "trellis2_image_to_raw_mesh", "auto_mode": False},
+        runtime,
+    )
+    assert plan["adapter"] == "trellis2_image_to_raw_mesh"
+    assert any("multi-GPU load sharing" in r or "low-VRAM" in r for r in plan["reasons"])
+
+
+def test_low_vram_mode_accepts_trellis2_when_free_vram_meets_low_threshold():
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 1,
+        "installed_adapters": ["trellis2_image_to_raw_mesh"],
+        "enabled_adapters": ["trellis2_image_to_raw_mesh"],
+        "free_vram_gb": 14.36,
+        "max_free_vram_gb": 14.36,
+        "aggregate_free_vram_gb": 14.36,
+    }
+    plan = plan_generation(
+        {"model_preference": "trellis2_image_to_raw_mesh", "auto_mode": False},
+        runtime,
+    )
+    assert plan["adapter"] == "trellis2_image_to_raw_mesh"
+
+
+def test_legacy_textured_mesh_model_preference_normalizes_to_raw_mesh():
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 2,
+        "installed_adapters": ["trellis2_image_to_raw_mesh", "trellis2_image_to_textured_mesh"],
+        "enabled_adapters": ["trellis2_image_to_raw_mesh", "trellis2_image_to_textured_mesh"],
+        "free_vram_gb": 14.36,
+        "max_free_vram_gb": 14.36,
+        "aggregate_free_vram_gb": 28.72,
+    }
+    plan = plan_generation(
+        {"model_preference": "trellis2_image_to_textured_mesh", "auto_mode": False},
+        runtime,
+    )
+    assert plan["adapter"] == "trellis2_image_to_raw_mesh"
+
+
+def test_random_seed_dynamic_assignment_when_seed_unspecified():
+    import random
+    from core.config import get_quality_config
+    from core.planner import get_planner_apply_config, resolve_seed_plan
+
+    request_inputs = {}
+    model_inputs = {}
+
+    seeds = set()
+    for _ in range(5):
+        seeds_cfg = dict(get_quality_config()["seeds"])
+        if model_inputs.get("seed") is None and request_inputs.get("seed") is None:
+            seeds_cfg["base_seed"] = random.randint(10000, 999999)
+        plan = resolve_seed_plan(
+            request_inputs,
+            model_inputs,
+            seeds_cfg=seeds_cfg,
+            apply_cfg=get_planner_apply_config(),
+        )
+        seed = plan["base_seed"]
+        assert 10000 <= seed <= 999999
+        seeds.add(seed)
+
+    # Over 5 runs with range 10000..999999, seeds should not all be identical
+    assert len(seeds) > 1
+
+
+

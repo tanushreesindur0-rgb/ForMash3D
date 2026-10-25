@@ -173,6 +173,95 @@ def _validate_texture_atlas_dimension(
     return True, actual, None
 
 
+def _normalize_textured_glb_pbr_defaults(glb_path: Path) -> int:
+    """Apply safe PBR defaults to albedo-only materials without re-exporting geometry.
+
+    glTF defaults an omitted metallicFactor to 1.0. For AI-painted materials that
+    carry base colour but no metallic/roughness map, this can render the albedo
+    almost black under a studio environment. Patch only omitted factors in the
+    GLB JSON chunk and leave geometry, images, extensions, and explicit factors
+    byte-for-byte intact.
+    """
+    payload = glb_path.read_bytes()
+    if len(payload) < 20:
+        raise RuntimeError("Textured GLB is truncated or missing its first chunk.")
+
+    magic, version, declared_length = struct.unpack_from("<4sII", payload, 0)
+    if magic != b"glTF" or version != 2 or declared_length != len(payload):
+        raise RuntimeError("Texturing adapter returned an invalid GLB 2.0 container.")
+
+    chunks: list[tuple[bytes, bytes]] = []
+    document: Optional[Dict[str, Any]] = None
+    offset = 12
+    while offset < len(payload):
+        if offset + 8 > len(payload):
+            raise RuntimeError("Textured GLB contains a truncated chunk header.")
+        chunk_length, chunk_type = struct.unpack_from("<I4s", payload, offset)
+        offset += 8
+        chunk_end = offset + chunk_length
+        if chunk_end > len(payload):
+            raise RuntimeError("Textured GLB contains a truncated chunk payload.")
+        chunk_payload = payload[offset:chunk_end]
+        if chunk_type == b"JSON":
+            if document is not None:
+                raise RuntimeError("Textured GLB contains duplicate JSON chunks.")
+            try:
+                parsed = json.loads(chunk_payload.decode("utf-8").rstrip(" \t\r\n\x00"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Textured GLB has an unreadable JSON chunk.") from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError("Textured GLB JSON root must be an object.")
+            document = parsed
+        chunks.append((chunk_type, chunk_payload))
+        offset = chunk_end
+
+    if document is None:
+        raise RuntimeError("Textured GLB has no JSON chunk.")
+
+    normalized_materials = 0
+    materials = document.get("materials", [])
+    if isinstance(materials, list):
+        for material in materials:
+            if not isinstance(material, dict):
+                continue
+            pbr = material.get("pbrMetallicRoughness")
+            if not isinstance(pbr, dict) or "baseColorTexture" not in pbr:
+                continue
+            # Preserve explicit authored factors; repair only the glTF metallic
+            # default for albedo-only materials and give missing roughness a
+            # neutral studio value.
+            before = dict(pbr)
+            if "metallicRoughnessTexture" not in pbr:
+                pbr.setdefault("metallicFactor", 0.0)
+                pbr.setdefault("roughnessFactor", 0.7)
+            if pbr != before:
+                normalized_materials += 1
+
+    if normalized_materials == 0:
+        return 0
+
+    rebuilt = bytearray(struct.pack("<4sII", b"glTF", 2, 0))
+    for chunk_type, chunk_payload in chunks:
+        if chunk_type == b"JSON":
+            chunk_payload = json.dumps(
+                document, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            chunk_payload += b" " * ((-len(chunk_payload)) % 4)
+        if len(chunk_payload) % 4:
+            raise RuntimeError(f"Textured GLB chunk {chunk_type!r} is not 4-byte aligned.")
+        rebuilt.extend(struct.pack("<I4s", len(chunk_payload), chunk_type))
+        rebuilt.extend(chunk_payload)
+
+    struct.pack_into("<I", rebuilt, 8, len(rebuilt))
+    temporary_path = glb_path.with_name(f".{glb_path.name}.pbr.tmp")
+    try:
+        temporary_path.write_bytes(rebuilt)
+        temporary_path.replace(glb_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return normalized_materials
+
+
 def _execute_texture_stage(
     job_id: str,
     asset_dir: Path,
@@ -185,9 +274,20 @@ def _execute_texture_stage(
     cancel_checker: CancelChecker = None,
     progress: GenerationProgress = None,
 ) -> Dict[str, Any]:
-    """Run centralized texture stage using Paint3D (1K/2K) or Hunyuan3D-Paint v2.1 (4K/8K)."""
+    """Run centralized texture stage using Paint3D (1K/2K), Hunyuan3D-Paint v2.1 (4K/8K), or TRELLIS.2."""
     _check_cancelled(cancel_checker)
-    model_id = "paint3d" if preset_label in {"1K", "2K"} else "hunyuan3d_paint_v21"
+    paint_preference = str(
+        job_inputs.get("paint_model_preference")
+        or job_inputs.get("paint_model")
+        or job_metadata.get("paint_model_preference")
+        or job_metadata.get("paint_model")
+        or ""
+    ).strip().lower()
+
+    if paint_preference in {"trellis2", "trellis2_paint", "trellis2_image_mesh_painting"}:
+        model_id = "trellis2_image_mesh_painting"
+    else:
+        model_id = "paint3d" if preset_label in {"1K", "2K"} else "hunyuan3d_paint_v21"
 
     ref_image_path = _resolve_reference_image(job_inputs, job_metadata)
     if not ref_image_path or not ref_image_path.is_file():
@@ -206,7 +306,67 @@ def _execute_texture_stage(
     textured_glb_path = texture_dir / f"{base_name}_textured.glb"
 
     try:
-        if preset_label in {"1K", "2K"}:
+        if model_id == "trellis2_image_mesh_painting":
+            adapter = None
+            try:
+                from core.scheduler.model_factory import ModelFactory
+                for key in ("trellis2_image_mesh_painting", "trellis2_paint"):
+                    if key in ModelFactory.ADAPTER_REGISTRY:
+                        adapter = ModelFactory.create_model_from_config({
+                            "model_id": key,
+                            "vram_requirement": 16000,
+                            "feature_type": "image_mesh_painting",
+                        })
+                        break
+            except Exception as e:
+                logger.debug("ModelFactory Trellis2-Paint lookup: %s", e)
+
+            if adapter is None:
+                try:
+                    from adapters.trellis2_paint_adapter import Trellis2ImageMeshPaintingAdapter
+                    adapter = Trellis2ImageMeshPaintingAdapter(vram_requirement=16000)
+                except Exception as exc:
+                    raise RuntimeError(f"TRELLIS.2 paint adapter could not be loaded: {exc}")
+
+            _check_cancelled(cancel_checker)
+            should_unload_t2 = False
+            from core.models.base import ModelStatus
+            if getattr(adapter, "status", None) in (ModelStatus.UNLOADED, ModelStatus.ERROR):
+                gpu_id = getattr(adapter, "gpu_id", None)
+                if gpu_id is None:
+                    import os
+                    cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+                    try:
+                        gpu_id = int(cuda_vis.split(",")[0])
+                    except Exception:
+                        gpu_id = 0
+                _emit(progress, 0.66, "texture", f"Loading {model_id} model on GPU {gpu_id}...")
+                adapter.load(gpu_id)
+                _emit(progress, 0.68, "texture", f"{model_id} model loaded successfully")
+                should_unload_t2 = True
+            try:
+                _emit(progress, 0.70, "texture", "Texturing mesh with TRELLIS.2...")
+                res = adapter.process({
+                    "mesh_path": str(target_mesh_path),
+                    "image_path": str(ref_image_path),
+                    "output_format": "glb",
+                    "extension_webp": True,
+                    "progress_callback": lambda stage, frac, msg: _emit(progress, frac, stage, msg),
+                    "timeout_seconds": 1800,
+                    "cancel_checker": cancel_checker,
+                })
+            finally:
+                if should_unload_t2:
+                    try:
+                        adapter.unload()
+                    except Exception:
+                        pass
+            out_mesh = res.get("output_mesh_path") if isinstance(res, dict) else None
+            if not out_mesh or not Path(out_mesh).is_file():
+                raise RuntimeError(f"TRELLIS.2 paint returned no output mesh: {res}")
+            shutil.copy2(out_mesh, textured_glb_path)
+
+        elif preset_label in {"1K", "2K"}:
             adapter = None
             try:
                 from core.scheduler.model_factory import ModelFactory
@@ -341,6 +501,13 @@ def _execute_texture_stage(
 
         _check_cancelled(cancel_checker)
 
+        normalized_material_count = _normalize_textured_glb_pbr_defaults(textured_glb_path)
+        if normalized_material_count:
+            logger.info(
+                "[POSTPROCESS TEXTURE] Applied safe PBR defaults to %d albedo-only material(s).",
+                normalized_material_count,
+            )
+
         standard_textured = texture_dir / "textured.glb"
         if not standard_textured.exists() or standard_textured.resolve() != textured_glb_path.resolve():
             shutil.copy2(textured_glb_path, standard_textured)
@@ -353,6 +520,24 @@ def _execute_texture_stage(
         if not valid_dim:
             raise RuntimeError(dimension_error or "Texture atlas dimensions could not be verified.")
         assert base_color is not None
+        pbr_output_report = _run_pbr_validation(textured_glb_path, required=True)
+        base_color_degenerate = any(
+            "degenerate texture map 'base_color'" in str(warning).lower()
+            for warning in pbr_output_report.get("warnings", [])
+        )
+        if pbr_output_report.get("uv_valid") is not True:
+            uv_warnings = [
+                str(warning) for warning in pbr_output_report.get("warnings", [])
+                if "uv" in str(warning).lower()
+            ]
+            raise RuntimeError(
+                "Textured GLB has missing or invalid UV coordinates: "
+                + ("; ".join(uv_warnings) if uv_warnings else "UV validation failed.")
+            )
+        if base_color_degenerate:
+            raise RuntimeError(
+                "Textured GLB contains a degenerate base-colour atlas (uniform black or white)."
+            )
         base_color.save(texture_dir / "base_color.png")
 
         logger.info(
@@ -365,6 +550,8 @@ def _execute_texture_stage(
             "preset": preset_label,
             "target_atlas_size": target_atlas_size,
             "validated_atlas_dimension": actual_dim,
+            "pbr_validation": pbr_output_report,
+            "normalized_material_count": normalized_material_count,
             "textured_glb": str(textured_glb_path),
             "texture_maps": {p.stem: str(p) for p in texture_dir.glob("*.png")},
         }
@@ -908,6 +1095,13 @@ def _export_glb(mesh: trimesh.Trimesh) -> bytes:
         _ = mesh.vertex_normals
     tree_postprocessor = None
     mat = getattr(getattr(mesh, "visual", None), "material", None)
+    if isinstance(mat, trimesh.visual.material.PBRMaterial):
+        if getattr(mat, "metallicFactor", None) is None:
+            mat.metallicFactor = 0.0 if getattr(mat, "metallicRoughnessTexture", None) is None else 1.0
+        if getattr(mat, "roughnessFactor", None) is None:
+            mat.roughnessFactor = 0.7 if getattr(mat, "metallicRoughnessTexture", None) is None else 1.0
+        if getattr(mat, "baseColorFactor", None) is None and getattr(mat, "baseColorTexture", None) is None:
+            mat.baseColorFactor = [0.82, 0.82, 0.82, 1.0]
     has_normal_tex = mat is not None and getattr(mat, "normalTexture", None) is not None
     if has_normal_tex and hasattr(mesh.visual, "uv") and mesh.visual.uv is not None:
         tangents = compute_mesh_tangents(mesh)
@@ -1338,6 +1532,8 @@ def _build_result(
         ),
         "zip_url": f"{base_url}/download?artifact_format=zip",
         "asset_root": str(asset_dir),
+        "topology": "Quad" if (generated.get("retopo_stats", {}).get("quad_faces") or inputs.get("topology_mode") == "quad" or meta.get("topology_mode") == "quad" or inputs.get("quad_topology") or meta.get("quad_topology")) else "Triangle",
+        "quad_topology": bool(generated.get("retopo_stats", {}).get("quad_faces") or inputs.get("topology_mode") == "quad" or meta.get("topology_mode") == "quad" or inputs.get("quad_topology") or meta.get("quad_topology")),
         "asset_name": asset_name,
         "target_polycount": target_polycount,
         "lod_enabled": lod_enabled,
@@ -2428,11 +2624,15 @@ def run_postprocess_job(
                         )
                         pbr_mat = None
                     else:
+                        base_factor = [1.0, 1.0, 1.0, 1.0] if base_img is not None else [0.82, 0.82, 0.82, 1.0]
                         pbr_mat = trimesh.visual.material.PBRMaterial(
                             name="GameReady_PBR",
                             normalTexture=norm_img,
                             baseColorTexture=base_img,
+                            baseColorFactor=base_factor,
                             metallicRoughnessTexture=orm_img,
+                            metallicFactor=0.0 if orm_img is None else 1.0,
+                            roughnessFactor=0.7 if orm_img is None else 1.0,
                             occlusionTexture=orm_img if orm_img is not None else ao_img,
                         )
                     if uvs is not None and pbr_mat is not None:
@@ -2508,7 +2708,18 @@ def run_postprocess_job(
         logger.info("[POSTPROCESS TEXTURE] Stage skipped: textured generation not requested")
     else:
         _save_file(glb_path, _export_glb(uv_mesh))
-        _emit(progress, 0.65, "texture", f"Generating {preset_label} textures with {'paint3d' if preset_label in {'1K', '2K'} else 'hunyuan3d_paint_v21'}...")
+        painter_display = (
+            "trellis2_paint"
+            if str(
+                job_inputs.get("paint_model_preference")
+                or job_inputs.get("paint_model")
+                or job_metadata.get("paint_model_preference")
+                or job_metadata.get("paint_model")
+                or ""
+            ).strip().lower() in {"trellis2", "trellis2_paint", "trellis2_image_mesh_painting"}
+            else ("paint3d" if preset_label in {"1K", "2K"} else "hunyuan3d_paint_v21")
+        )
+        _emit(progress, 0.65, "texture", f"Generating {preset_label} textures with {painter_display}...")
         texture_stage_info = _execute_texture_stage(
             job_id=job_id,
             asset_dir=asset_dir,
@@ -2560,7 +2771,18 @@ def run_postprocess_job(
     _check_cancelled(cancel_checker)
     _emit(progress, 0.62, "game_ready", "Writing game-ready formats.")
     if not is_raw_native_passthrough:
-        game_ready_glb_bytes = _export_glb(game_ready_mesh)
+        if texture_stage_info.get("status") == "completed" and texture_stage_info.get("textured_glb"):
+            textured_source_path = Path(texture_stage_info["textured_glb"])
+            if not textured_source_path.is_file():
+                raise FileNotFoundError(
+                    f"Validated textured GLB disappeared before final export: {textured_source_path}"
+                )
+            # load_mesh() flattens GLB scenes for geometric metrics/LODs. Do not
+            # re-export that flattened Trimesh: it can discard per-node materials,
+            # UV assignments, and embedded texture bindings from the painter output.
+            game_ready_glb_bytes = textured_source_path.read_bytes()
+        else:
+            game_ready_glb_bytes = _export_glb(game_ready_mesh)
     _save_file(glb_path, game_ready_glb_bytes)
     game_ready["glb"] = str(glb_path)
     pbr_validation_required = bool(texture_enabled or native_textures or should_bake)
@@ -2805,11 +3027,17 @@ def run_postprocess_job(
             "warnings": [f"Final inspection failed: {exc}"],
         }
 
+    is_quad_dominant = bool(retopo_stats.get("quad_faces")) or (is_quad_requested and retopo_ran)
+    quad_face_count = retopo_stats.get("quad_face_count") or (len(retopo_stats["quad_faces"]) if retopo_stats.get("quad_faces") else None)
+
     quality_trace["game_ready"] = {
         **mesh_stats(uv_mesh).model_dump(),
         "native_textures": _has_native_textures(uv_mesh),
         "uv_seam_vertex_delta": len(uv_mesh.vertices) - len(mesh.vertices),
         "qa": qa_report,
+        "quad_dominant": is_quad_dominant,
+        "quad_face_count": quad_face_count,
+        "topology": "Quad" if is_quad_dominant else "Triangle",
     }
     final_topology_gate = evaluate_topology_gate(
         mesh=uv_mesh.copy(),

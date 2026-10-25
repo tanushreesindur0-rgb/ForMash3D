@@ -1,3 +1,46 @@
+## 2026-10-24 — Dynamic Random Seed Assignment & Unique3D Refinement Safeguards
+
+- **Dynamic Random Seed Assignment**:
+  - Root cause: `features/workspace/store/WorkspaceContext.tsx` and `stores/useAppStore.ts` hardcoded `seed: 42891`, and `backend/core/planner.py` / `quality.yaml` defaulted to static `base_seed: 42891`, causing every generation job without an explicit user seed to repeat the fixed schedule `[42891, 44228, 45565]`.
+  - Fix: Updated `WorkspaceContext.tsx` and `useAppStore.ts` to assign dynamic random seeds (`Math.floor(Math.random() * 900000) + 100000`). In `multiprocess_scheduler.py`, when a job has no explicit user seed, dynamically generate a fresh random base seed (`random.randint(10000, 999999)`).
+- **Unique3D Refinement Safeguards**:
+  - Root cause: When `do_refine: True` was enabled without SD controlnet tile IP-adapter weights loaded in `model_zoo`, `pipe_disney_controlnet_tile_ipadapter_i2i` returned `None`, raising `TypeError: 'NoneType' object is not callable` in `refine_lr_to_sr.py` / `refine_rgb`.
+  - Fix: In `backend/adapters/unique3d_adapter.py`, inspect `model_zoo.pipe_disney_controlnet_tile_ipadapter_i2i` and demote `effective_do_refine = False` if missing. In `backend/thirdparty/Unique3D`, safely bypass refinement and fall back to Lanczos resizing when `pipe is None`. Pushed sub-repo changes to `Silentzx2/ForMash3D-ThirdParty` (`main`).
+- **Verification**: 53 passed, 7 skipped backend tests, 55 passed bun tests, `npx tsc --noEmit` clean.
+
+## 2026-10-24 — Multi-GPU Load Sharing Planning & Raw Mesh Model Route Normalization
+
+- **Multi-GPU VRAM load sharing in planner**:
+  - Root cause: `backend/core/runtime_probe.py` only queried GPU 0 (`torch.cuda.mem_get_info(0)`), setting `free_vram_gb` to single-device memory (e.g. 14.36 GB). In `backend/core/planner.py`, candidates were rejected if `vram_budget_gb > free_vram_gb`, ignoring `multi_gpu` capability where aggregate VRAM across multiple GPUs (e.g. 28.72 GB) satisfies the model budget (23.0 GB) and `low_vram_supported` threshold (10.0 GB).
+  - Fix: Extended `probe_runtime` to inspect all devices (`gpu_count`, `aggregate_free_vram_gb`, `max_free_vram_gb`). Updated planner Check D to allow multi-GPU load sharing when `multi_gpu` is enabled and aggregate VRAM >= model budget, or low-VRAM sequential offload mode when free VRAM >= low-VRAM requirement.
+- **Raw mesh model routing**:
+  - Root cause: UI and preset priorities referenced deprecated legacy textured alias `trellis2_image_to_textured_mesh` instead of `trellis2_image_to_raw_mesh` for `image-to-raw-mesh` generation.
+  - Fix: Registered `trellis2_image_to_raw_mesh` in `constants/models.ts` and set as default in `app/page.tsx` and `GeneratePanel.tsx`. Updated `smart_presets.yaml` priorities. Added legacy alias mapping in `backend/api/routers/mesh_generation.py` and `backend/core/planner.py` to route all legacy textured requests to raw geometry models.
+- **Verification**: 52 passed / 6 skipped pytest, 55 passed bun test, `tsc --noEmit` clean. No git push per user instruction.
+
+## 2026-10-24 — Postprocess / viewer regression fixes
+
+- **Auto-rig scheduling:** `backend/api/routers/auto_rigging.py` now imports `sha256_file` from `core.utils.artifact_utils`, the canonical streaming hash utility; it no longer imports the removed private `_sha256_file` name from `postprocess.pipeline`.
+- **Black albedo-only texture output:** the texture stage patches only missing PBR factors inside the GLB JSON chunk (preserving the mesh, images and binary chunks), checks UV validity and rejects an all-black/all-white base-colour atlas, and retains the painter's GLB for final game-ready export rather than flattening a multi-node scene and re-exporting one `Trimesh`.
+- **Retopology quality protection:** `run_auto_retopo` checks surface drift through the existing `quality.gate.max_native_mesh_normalized_drift` threshold from `backend/config/quality.yaml`. A failed/unverifiable drift check rejects the retopo candidate; pipeline callers that already catch retopo exceptions continue with their prior repaired mesh.
+- **Viewport shading:** imported normal attributes containing zero-length or non-finite vectors are recomputed. Wireframe mode now draws visible edges over an opaque depth-writing base surface, so back-facing/rear/internal edges are not rendered as a second wireframe shell. This fixes the viewer presentation path; it does not delete genuine overlapping geometry in a source file.
+- **Verification boundary:** focused regression tests were added for canonical hash import, retopo drift, textured GLB chunk preservation and invalid normals. The push-triggered GitHub Actions checks must be inspected before claiming tests passed. GPU inference and comparison against the user's actual asset are not performed by these source-level tests.
+
+## 2026-10-24 — Auto-Seeds Activation, Rate-Limiter Deactivation, Non-Textured PBR Shading & Quad Topology Fixes
+
+- **Non-textured mesh PBR shading fix (weird black mirror with white specks)**:
+  - Root cause: In `backend/postprocess/pipeline.py` & `auto_uv.py`, untextured/baked GLTF meshes exported `PBRMaterial` without `pbrMetallicRoughness` factors. In the glTF 2.0 / Three.js specification, omitted metallic factors default to `1.0` (100% metallic mirror) with zero diffuse reflectance, turning the mesh pitch black with noisy specular white specks.
+  - Fix: Added explicit studio clay PBR factors (`metallicFactor=0.0`, `roughnessFactor=0.7`, `baseColorFactor=[0.82, 0.82, 0.82, 1.0]`) in `_export_glb`, bake material assembly, and `auto_uv.py`. Also added protective metalness clamping in `MeshViewer.tsx` for any loaded untextured GLTF.
+- **Quad topology conversion fix**:
+  - Root cause: `to_quad_dominant` in `remesh.py` unconditionally invoked `pymeshlab.MeshSet()`, which crashed with `AttributeError` on environments without pymeshlab (`ml is None`), causing quad conversion to silently abort and retain triangles. Additionally, `pipeline.py` never populated `topology: "Quad"` or `quad_dominant: True` in `_build_result` or `quality_trace["game_ready"]`.
+  - Fix: Implemented pure-Python/NumPy curvature-aware greedy triangle pairing (`pair_triangles_to_quads`) as an automatic zero-dependency fallback. Wired `topology: "Quad"` and `quad_topology: True` into `_build_result` and `quality_trace["game_ready"]`, ensuring quad OBJ export and quad metadata contract.
+- **Auto-seeds enabled**:
+  - `backend/config/planner_rules.yaml`: set `apply.auto_seeds: true` so the planner automatically executes multi-seed candidate scoring for requested quality tiers instead of collapsing to a single candidate.
+- **Rate limiting disabled for personal/self-hosted deployment**:
+  - `backend/config/system.yaml` & `backend/core/config.py`: configured `rate_limit_enabled: false` and `rate_limit_per_minute: 0`.
+  - `backend/api/dependencies.py`: short-circuited `apply_rate_limit`, `check_rate_limit`, and `_rate_limit_result` when disabled or limit <= 0 to eliminate HTTP 429 locks during concurrent telemetry HUD polling, task progress polling (`/api/v1/system/jobs/*`), and client action logging.
+  - Verification: 12/12 pytest tests pass (`test_topology_repair.py`, `test_seed_request_contract.py`), 54/54 bun tests pass, `tsc --noEmit` 0 errors.
+
 ## 2026-10-23 — Production Readiness + Beta Phase
 
 - Auth removed entirely from backend + frontend (personal/self-hosted use, no paid SaaS)
