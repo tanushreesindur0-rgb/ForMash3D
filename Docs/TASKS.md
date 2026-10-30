@@ -1,177 +1,255 @@
-# TASKS — CPU-Safe Setup + GitHub SEO / Contributor Growth (ForMash3D)
+# MESH QUALITY PLAN — Post-Processing Pipeline + Raw Mesh Size Limits (Option A)
 
-> COMPLETED 2026-10-23 — Production readiness pass: auth removed entirely from backend + frontend, feature improvements done, `bun test` 54 pass / 0 fail (10 files), `python3 -m pytest backend/tests/` 40 passed / 6 skipped (GPU-dependent), `npx tsc --noEmit` zero errors. Tree at green `dev` HEAD, pushed to `origin/dev`.
+## Goal
+Raw AI mesh (TRELLIS, TRELLIS.2, Hunyuan3D-Shape/Paint/DiT, TripoSG, Unique3D, Pixal3D, Hi3D) ko Tripo AI level quality tak lana — **sirf post-processing ke zariye**, koi adapter inference profile change nahi, koi SDF implement nahi.
 
-Repo: `Silentzx2/ForMash3D` · base commit read: `eca1d78` (main) · Apache-2.0
-Branch rule: work on `main`; leave `dev` / `Dev` untouched.
+Raw mesh pehle adapter se generate hota hai (full quality, immutable), phir post-processing pipeline usko clean karta hai:
+- Holes fill karna
+- Jagged sharp edges ko smooth karna (Taubin smoothing, 4 iterations)
+- Non-manifold / winding fix
+- Curvature-aware decimation (crease protect >35°)
+- Quad-dominant retopology
+- Normal map baking (master → game_ready)
 
----
+master/source.glb hamesha immutable rehta hai — kabhi mutate nahi hota.
 
-## 0. AGENT OPERATING RULES (MANDATORY)
+Raw mesh ka vertex/face count 500k se zyada nahi hona chahiye taaki server OOM na ho. Ye limit quality.yaml aur models.yaml mein mesh.limits ke zariye enforce hoti hai.
 
-ROLE: Bash/Installer Engineer (conda/uv/PyTorch wheels, apt, CUDA detection) + GitHub OSS Growth Engineer.
+## Scope (In Scope)
+- Post-processing pipeline: hole filling (`fill_holes`), winding fix (`fix_winding`), normal repair (`fix_normals`), Taubin smoothing (`lamb=0.3, nu=-0.34, iterations=4`)
+- Curvature-aware decimation: protect crease angles >35°, more polys on curved surfaces
+- Quad-dominant retopology (AutoRetopo), target polycount from smart_presets.yaml
+- Normal map baking: high-poly master → low-poly game_ready (OpenGL Y+ tangent space)
+- Frontend QualityBadge: Sharp / Clean / Needs Review
+- Frontend telemetry: triangle count, non-manifold edges, holes, UV utilization
+- Presets derived from backend smart_presets.yaml only (no hardcoded UI values)
+- Raw mesh size limits: `mesh.limits` in quality.yaml + `mesh_limits` per model in models.yaml
+- Code snippets and implementation guides for every fix — all wired code, no placeholders/mocks
 
-1. FIRST verify startup flow: `scripts/setup.sh`, `scripts/start.sh`, `backend/scripts/install.sh`, `manager.sh`, `Dockerfile`, `docker-compose.yml`, `.env.example`. The existing GPU/CUDA path must behave EXACTLY as today (same commands, same order).
-2. NO full-repo scan. Read only: `RULES.md`, `README.md`, `Docs/ARCHITECTURE.md`, `Docs/TASKS.md`, `Docs/api-documentation.md`, `CONTRIBUTING.md`, and the exact files named in this task.
-3. Never invent features, metrics, or status. Unverifiable => write `TODO: user to confirm`.
-4. Output: ZERO filler. No blank-line padding. Do not reprint unchanged code. Replacement-only diffs with exact file paths + line anchors. Explanations max 2 sentences per item.
-5. Deliver ONE zip containing only new/modified files. Push to `main`/PR only if possible.
-6. Final step: sync docs (section 5).
+## Scope (Out of Scope)
+- Adapter inference profiles — NOT CHANGED (_LOCKED_INFERENCE_PROFILE stays exactly as-is)
+- SDF implementation — TripoSG's internal code, not ForMash3D's
+- Scheduler pre-flight validation — NOT IN THIS PLAN (limits enforced post-extraction, not pre-inference)
+- Multi-view image input — removed
+- Cloud, payment, mobile app, real-time collaboration — out of scope
 
----
+## Model-Wise Quality Gaps & Post-Processing Fixes
 
-## 1. VERIFIED FINDINGS (read from repo; install NOT executed — no GPU/conda in review sandbox. `bash -n` syntax check passed on both scripts)
+### TRELLIS / TRELLIS.2
+**Issues:** Holes in mesh (dress/skirt gaps), jagged sharp edges, sparse voxel artifacts
+**Root cause:** `fill_holes = simplify != 0.0` meant holes never filled at default `simplify=0.0`. No repair after `to_trimesh()`.
+**Fix done (commit df6b01c4):** Unconditional `fill_holes`, `fix_winding`, `fix_normals`, Taubin smoothing (4 iterations) on textured + raw paths.
+**No adapter profile changes needed.**
 
-| # | Finding | Where |
-|---|---------|-------|
-| F1 | CPU-only detect only prints a warning ("proceeding with CPU fallback") and then continues the FULL CUDA install | `scripts/setup.sh` `detect_gpu()` |
-| F2 | `detect_gpu` results (`GPU_AVAILABLE`, `CUDA_VERSION`) are NOT exported, so `install.sh` (separate process) never knows the mode | `scripts/setup.sh` -> `backend/scripts/install.sh` |
-| F3 | `install.sh` hard-installs `torch==2.6.0 ... --index-url .../whl/cu124` and exits 1 on failure | `install.sh` ~L331-338 |
-| F4 | CUDA-only wheels downloaded even on CPU (`download_release_wheels` in setup.sh, `ensure_release_wheels` in install.sh) | `setup.sh`, `install.sh` ~L124, L350 |
-| F5 | All model stacks installed unconditionally: TRELLIS/TRELLIS.2 + kaolin (L369-455), Hunyuan3D shared/shape/paint/DiT (L457-590), UniRig, partuv, FastMesh (L592-640), Unique3D incl. pytorch3d source build + torch_scatter cu124 + xformers cu124 (L640-713), ARDY (L715), Paint3D (L728), TripoSG (L738), Pixal3D (L751), natten cu124 wheel (L767), TaoFlowForge (L802) | `install.sh` |
-| F6 | `err` is called but never defined in setup.sh (only `log/info/warn/fail` exist) -> "command not found" on old NVIDIA driver path | `scripts/setup.sh` L242-243 |
-| F7 | `ensure_thirdparty_submodule` runs `git submodule update --remote --merge` on every setup (moves to latest remote HEAD; non-reproducible, heavy) | `scripts/setup.sh` |
-| F8 | `install.sh` has no `set -e`; failed model installs can be silently skipped | `install.sh` |
-| F9 | `backend/requirements.txt` has `--extra-index-url .../cu124`; with `--index-strategy unsafe-best-match` a transitive `torch` dependency could replace a CPU torch with a `+cu124` build | `backend/requirements.txt` |
-| F10 | Runtime already tolerates missing/CPU torch in core: guarded imports in `core/config.py`, `gpu_monitor.py`, `runtime_probe.py`, `api/routers/system.py`; adapters are lazy-loaded via `adapters/__init__.py` `_ADAPTER_MAP` | backend |
-| F11 | ARDY is documented CPU-only (README) -> optional CPU-capable extra | README, `thirdparty/ardy` |
-| F12 | Main repo has no `.gitattributes`; wheels now come from GitHub Release tag `Wheels` (not LFS). `ForMash3D-ThirdParty` README may still say "Git LFS mandatory" (not re-checked) | verify |
-| F13 | `Dockerfile` base is `nvidia/cuda:12.4.1`, compose uses `runtime: nvidia` -> Docker has no CPU path | Docker |
+### Hunyuan3D-Shape-v2.1
+**Issues:** Non-manifold geometry, over-smoothed surfaces
+**Fix:** Same post-processing repair (hole fill, winding fix, normals, Taubin smoothing) applied after extraction — same as TRELLIS.
+**No adapter profile changes needed.**
 
----
+### Hunyuan3D-DiT-v2-mini-Turbo
+**Issues:** Low-poly output, face reducer caps
+**Fix:** Post-processing repair applied after extraction.
+**No adapter profile changes needed.**
 
-## 2. TASK A — CPU-ONLY AUTO MODE FOR `setup.sh` / `install.sh`
+### Hunyuan3D-Paint-v2.1
+**Issues:** Texture over-baked, low quality texture guide
+**Fix:** Separate mesh generation from texture stage; normal bake from high-poly master → low-poly game_ready.
+**No adapter profile changes needed.**
 
-GOAL: If no NVIDIA GPU is detected at start, setup skips ALL model/CUDA dependencies but still installs everything else (frontend, backend core API, postprocess, Redis, dirs, `.env`) so the app boots and the non-GPU parts work. UI/backend graceful-degradation is out of scope (see section 4).
+### TripoSG
+**Issues:** Deviates from reference image, works bad with low-res/pixel-art, raw mesh can be ~3.4M vertices
+**Fix:** Post-processing repair only — no adapter changes. Raw mesh vertex cap at 500K via models.yaml mesh_limits.
+**No adapter profile changes needed.**
 
-STATUS: not started — planned only; no acceptance criteria met (A6 all [ ]). No scripts changed yet.
+### Unique3D
+**Issues:** Fragmented wisps, holes, collapsed surface (normal orientation, Poisson depth)
+**Fix done (commit a90561f):** Per-face normal flip + depth-8 Screened Poisson in `fast_geo()`. Post-processing repair applied on top.
+**No adapter profile changes needed.**
 
-### A1. Single source of truth for compute mode
-- Add `FORMASH3D_COMPUTE=auto|cpu|cuda` (default `auto`) + flags `--cpu`, `--gpu` in `setup.sh` and `install.sh` (same parse style as `--auto`, `--venv`).
-- `auto`: `nvidia-smi -L` returns >=1 device -> `cuda`, else `cpu`. Keep `CUDA_FORCE_PRESENT=1` test hook working.
-- Put the resolver in one shared file `scripts/lib/compute_mode.sh` (sourced by both scripts) to avoid duplicated logic. `install.sh` must also resolve on its own when run standalone.
-- `export FORMASH3D_COMPUTE`, persist to `.env` (reuse `persist_env_config` pattern), print one clear line: `[SETUP] Compute mode: cpu (no NVIDIA GPU detected) — model dependencies will be skipped`.
-- `REQUIRE_GPU=1` must still abort when mode resolves to `cpu`.
+### Pixal3D
+**Issues:** Messy topology, spiral lines, bad poly distribution
+**Fix:** Post-processing repair + retopology integration.
+**No adapter profile changes needed.**
 
-### A2. `scripts/setup.sh` changes (CPU mode only)
-- SKIP: `setup_cuda_124`, `_sanitize_apt_cuda_sources`, `download_release_wheels`, `build_deps` (ninja/CUDA arch exports).
-- `ensure_thirdparty_submodule`: SKIP init in CPU mode unless `--with-thirdparty`. (Also fix F7: use `git submodule update --init --recursive` only; make `--remote --merge` opt-in via `--update-thirdparty`.)
-- KEEP: `require_commands`, `ensure_bun_or_npm`, `ensure_uv`, `ensure_redis`, `create_directories`, `install_frontend_deps`, `install_backend`, `summary`.
-- Fix F6: define `err(){ printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }`.
-- Replace the misleading "Generation jobs will fail" warning with an accurate CPU-mode message.
-- Summary screen: show mode (`cpu`/`cuda`) and list what was skipped.
+### Hi3D (Experimental)
+**Issues:** Needs coarse mesh input, dummy icosphere fallback causes collapse
+**Fix done:** Refinement route with `coarse_mesh_path`, `_legacy.glb` archival. Post-processing repair applies after refinement.
+**No adapter profile changes needed.**
 
-### A3. `backend/scripts/install.sh` changes
-1. Torch step (F3): in `cpu` mode install CPU wheels: `torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu`. `cuda` mode: unchanged cu124 command.
-2. Guard `ensure_release_wheels` (F4) -> `cuda` only. Keep `ensure_blender` (it is optional and already env-gated by `BLENDER_ENABLED`).
-3. Wrap the model-specific blocks (F5: TRELLIS … TaoFlowForge, ~L369-815) in one function `install_model_stacks()`, call it only when mode = `cuda`. Keep outside the guard: `backend/requirements.txt` core install, test requirements (~L792-799), system runtime libs (~L826+), runtime validation (~L860+).
-4. In CPU mode, optionally install ARDY (F11) only with `--cpu-extras` (default OFF); needs `--with-thirdparty`.
-5. Split requirements to remove F9 risk without changing GPU flow:
-   - `backend/requirements-core.txt` = API, postprocess, trimesh/open3d/pymeshlab/scipy/etc. (CPU-safe)
-   - `backend/requirements-models.txt` = model-only packages (diffusers/transformers/realesrgan/peft/timm/kornia/accelerate/datasets… — agent must classify by reading imports, not guess)
-   - `backend/requirements.txt` = `-r requirements-core.txt` + `-r requirements-models.txt` (GPU flow identical).
-   - CPU mode installs `requirements-core.txt` with a constraints file pinning torch to the installed CPU build (`-c`), and WITHOUT the `cu124` extra-index-url.
-6. Validation block: in CPU mode print `Compute mode: cpu` and do not warn about missing CUDA; do not call the `Paint3DAdapter` import check in CPU mode.
-7. Do NOT add `set -e` globally (F8 would change GPU behavior). Instead make the CPU path fail loudly on core-install errors only.
+## Raw Mesh Size Limits — backend/config/quality.yaml
 
-### A4. `scripts/start.sh` / `manager.sh`
-- Verify `start.sh` boots in CPU mode (it already skips `CUDA_VISIBLE_DEVICES` when `nvidia-smi` is absent). In CPU mode explicitly export `CUDA_VISIBLE_DEVICES=""` and `FORMASH3D_COMPUTE=cpu`.
-- `manager.sh` option that runs setup (L313): pass through `--cpu/--gpu`.
+Add a `mesh.limits` section. These are the SINGLE SOURCE OF TRUTH for all model vertex/face caps:
 
-### A5. Tests (CPU-only, no GPU needed)
-- Extend `scripts/tests/script_test.sh`: resolver returns `cpu` when `nvidia-smi` is absent (PATH-stub), `cuda` with `CUDA_FORCE_PRESENT=1`, flags override env, `REQUIRE_GPU=1` aborts on cpu.
-- Static grep test: in CPU mode the script text path contains no `cu124` / `kaolin` / `natten` / `pytorch3d` invocation reachable (guard check).
-- `.github/workflows/backend-runtime-ci.yml`: add a job that runs the resolver tests on `ubuntu-latest` (it has no GPU, which is the CPU case).
+```yaml
+quality:
+  mesh:
+    # Hard caps to prevent server OOM from runaway raw mesh generation.
+    # Raw mesh from any adapter must not exceed these limits.
+    max_vertices_per_mesh: 500000      # 500K vertices absolute ceiling for ANY model
+    max_faces_per_mesh: 1000000        # 1M faces absolute ceiling for ANY model
+    max_triangles_per_mesh: 1000000    # 1M triangles absolute ceiling for ANY model
 
-### A6. Acceptance criteria
-- [ ] On a machine WITHOUT NVIDIA: `bash scripts/setup.sh --auto` finishes with exit 0, no CUDA/torch-cu124/wheel/thirdparty downloads, `.env` has `FORMASH3D_COMPUTE=cpu`.
-- [ ] `bash scripts/start.sh` -> frontend `:3000` and backend `:7842/health` respond; `/docs` loads; `GET /api/models` does not return 500.
-- [ ] On a machine WITH NVIDIA (or `CUDA_FORCE_PRESENT=1` dry run): command sequence identical to current behavior (diff of executed commands = empty).
-- [ ] `bash -n` passes on every edited script; `shellcheck` warnings not worse than before.
-- [ ] `--gpu` forces the cuda path; `--cpu` forces cpu even if a GPU exists.
+    # Per-model default targets (not hard caps, recommended defaults)
+    default_target_vertices: 200000
+    default_target_faces: 400000
 
----
+    # Decimation trigger: if raw output exceeds this, auto-decimate BEFORE
+    # saving to master/source.glb. Master stays immutable after this point.
+    decimation_trigger_vertices: 300000
+    decimation_trigger_faces: 600000
 
-## 3. TASK B — GITHUB SEO + CONTRIBUTOR GROWTH
+    # Crease angle for edge-preserving decimation (shared SSOT)
+    shared:
+      feature_edge_angle_deg: 35.0
 
-GOAL: more developers find the repo and can start contributing in under 10 minutes. Honest positioning: beta, contributors wanted.
+    # Immutable raw mesh protection
+    immutable_master: true
+    master_path: "master/source.glb"
+    never_mutate_master: true
+```
 
-STATUS: not started — planned only; no acceptance criteria met (B5 all [ ]). No community/SEO files added yet.
+## Per-Model Vertex/Face Caps — backend/config/models.yaml
 
-### B1. README.md (40 KB — too long above the fold)
-- Replace H1 text with a keyword title: `ForMash3D — Open-Source Self-Hosted Image-to-3D AI Generator` (keywords: image to 3D, text to 3D, self-hosted, open source, game-ready, GLB, retopology, PBR, LODs, auto-rigging).
-- First 160 characters of the README must contain the core pitch (they are used by search snippets).
-- Quick Start line (L27) currently says `bun install` -> `bash scripts/start.sh`, which does not match the real flow (`scripts/setup.sh` first). Make Quick Start match reality; add a second line for CPU/no-GPU mode once Task A lands.
-- Add above the fold: "Beta — contributors wanted" + links to `CONTRIBUTING.md` and `docs/GOOD_FIRST_ISSUES.md`.
-- Add badges: GitHub stars, last commit, issues, `CPU mode supported` (only after A6 passes). Keep the existing CUDA badge.
-- Add a table of contents; keep the architecture mermaid/diagram; add a "Choose your contributor path" block: (A) no GPU: UI/UX, docs, tests, API, postprocess; (B) GPU: adapters, quality pipeline.
-- Replace remaining "AI Studio" wording in docs (backward-compatible env var names like `AI_STUDIO_ENV_MANAGER` stay).
+Add `mesh_limits` to each model entry. These are HARD CAPS — raw mesh from adapter will not exceed these:
 
-### B2. New / extended community files
-- `CONTRIBUTING.md` (exists, 3.7 KB): add dev setup (GPU + CPU), branch/PR flow, how to pick an issue, PR checklist.
-- Create `CODE_OF_CONDUCT.md`, `SECURITY.md` (root; link to `Docs/SECURITY.md`), `.github/PULL_REQUEST_TEMPLATE.md`, `.github/labels.yml` (good first issue, help wanted, no-gpu, needs-gpu, adapter, ui/ux, docs, quality).
-- Inspect `.github/ISSUE_TEMPLATE/repo.json` (unexpected file in a template folder); report, do not delete without confirmation. Add `config.yml` linking to Discussions.
-- `docs/GOOD_FIRST_ISSUES.md`: 15-20 issue drafts derived from real gaps in `Docs/TASKS.md` (e.g. `1C.1` pending GPU benchmark), `Docs/MEMORY.md`, `RULES.md`. >=10 must be `no-gpu`. Each: title, files, acceptance criteria, difficulty, est. hours, labels.
-- `docs/ARCHITECTURE_FOR_CONTRIBUTORS.md` (<=1.5 pages): folder map, request flow, where to add an adapter / UI panel / test.
+```yaml
+image_to_raw_mesh:
+  triposg_image_to_raw_mesh:
+    mesh_limits:
+      max_vertices: 500000      # TripoSG was producing 3,434,000 — hard cap at 500K
+      max_faces: 1000000
+    vram_requirement: 8192
 
-### B3. Discoverability pack — `docs/GITHUB_SETUP.md` (copy-paste values; the agent CANNOT set these)
-- Repo description (<=350 chars, keyword-rich), website URL.
-- 15-20 topics (e.g. `image-to-3d`, `text-to-3d`, `3d-generation`, `generative-ai`, `self-hosted`, `fastapi`, `nextjs`, `glb`, `mesh-generation`, `retopology`, `game-assets`, `pytorch`, `hunyuan3d`, `trellis`, `help-wanted`, `good-first-issue`).
-- Social preview image spec: 1280x640 PNG (`assets/banner.png` exists — check its size; create a variant if needed).
-- Enable Discussions + categories; pin 3-5 starter issues; Release `v0.1.0-beta` notes draft (`docs/RELEASE_NOTES_DRAFT.md`).
-- Verify `ForMash3D-ThirdParty` repo: rename any "AI Studio" text, fix Git LFS statements if LFS is gone (F12), add topics, link back to the main repo.
+  trellis2_image_to_raw_mesh:
+    mesh_limits:
+      max_vertices: 500000
+      max_faces: 1000000
+    vram_requirement: 23552
 
-### B4. Outreach pack — `docs/OUTREACH.md`
-- Ready-to-post drafts: Reddit (r/opensource, r/gamedev, r/StableDiffusion, r/LocalLLaMA, r/3Dprinting only if relevant), Hacker News "Show HN", Dev.to/Hashnode, X/LinkedIn, Hugging Face community.
-- Lists to submit to: up-for-grabs.net, goodfirstissue.dev, awesome-lists for 3D generation / self-hosted.
-- 60-second demo video script + GIF checklist (GIF/screenshots are the single biggest star driver; use only real captures — placeholders marked `TODO: user to add`).
-- 30-day plan: wk1 setup+CPU mode, wk2 launch, wk3 first-PR welcome, wk4 recognition (all-contributors).
+  trellis_image_to_raw_mesh:
+    mesh_limits:
+      max_vertices: 400000
+      max_faces: 800000
+    vram_requirement: 11776
 
-### B5. Acceptance criteria
-- [ ] README top 160 chars + H1 contain target keywords; Quick Start is verified against real scripts.
-- [ ] `CODE_OF_CONDUCT.md`, `SECURITY.md`, PR template, labels, >=15 issue drafts exist.
-- [ ] `docs/GITHUB_SETUP.md` has ready-to-paste values; manual checklist <=10 lines at the end of the agent's reply.
-- [ ] No claim in README/outreach that is not backed by `Docs/*` or code.
+  hunyuan3d_shape_v21_image_to_raw_mesh:
+    mesh_limits:
+      max_vertices: 400000
+      max_faces: 800000
+    vram_requirement: 10240
 
----
+  hunyuan3d_dit_v2_mini_turbo_image_to_raw_mesh:
+    mesh_limits:
+      max_vertices: 200000
+      max_faces: 400000
+    vram_requirement: 6144
 
-## 4. OUT OF SCOPE (LATER — per owner)
-- UI: capability-aware model selector ("Requires NVIDIA GPU" badges, CPU-mode banner).
-- Backend: `/api/capabilities`, `MockAdapter` (sample GLB, real postprocess on CPU), graceful job rejection on CPU, `FORMASH3D_COMPUTE` read by runtime.
-- `Dockerfile.cpu` + compose `cpu` profile (F13).
-- Optional remote GPU adapter (`REMOTE_GPU_URL`).
+  unique3d_image_to_raw_mesh:
+    mesh_limits:
+      max_vertices: 300000
+      max_faces: 600000
+    vram_requirement: 10240
 
----
+  pixal3d_image_to_raw_mesh:
+    mesh_limits:
+      max_vertices: 400000
+      max_faces: 800000
+    vram_requirement: 18432
 
-## 5. FINAL STEP — DOCUMENTATION SYNC (MANDATORY)
+  hi3d_image_to_raw_mesh:
+    mesh_limits:
+      max_vertices: 300000
+      max_faces: 600000
+    vram_requirement: 16384
 
-### 5A. CPU setup mode (Task A) — implemented
-- `scripts/lib/compute_mode.sh` created — shared `FORMASH3D_COMPUTE` resolver (auto|cpu|cuda)
-- `scripts/setup.sh` — `--cpu`/`--gpu` flags, skips CUDA steps in CPU mode, `err()` defined, thirdparty submodule opt-in, summary shows mode+skipped
-- `scripts/start.sh` — CPU mode exports `CUDA_VISIBLE_DEVICES=""` and `FORMASH3D_COMPUTE=cpu`
-- `manager.sh` — `setup` passes through `--cpu`/`--gpu`/`--with-thirdparty`/`--update-thirdparty`
-- `backend/scripts/install.sh` — `--cpu`/`--gpu`/`--cpu-extras`/`--with-thirdparty` flags, CPU torch wheels, `ensure_release_wheels` cuda-only, model stacks wrapped in `install_model_stacks()`, requirements split into core+models
-- `backend/requirements-core.txt` created — CPU-safe dependencies
-- `backend/requirements-models.txt` created — model-only (GPU) dependencies
-- `backend/requirements.txt` — now `-r requirements-core.txt` + `-r requirements-models.txt`
-- `scripts/tests/script_test.sh` — resolver tests + static grep test added
-- `.github/workflows/backend-runtime-ci.yml` — resolver test job added
-- `bash -n` passes on all edited scripts
-- Status: IMPLEMENTED (not pushed — pending user review)
+image_mesh_painting:
+  trellis_image_mesh_painting:
+    mesh_limits:
+      max_vertices: 500000
+      max_faces: 1000000
+    vram_requirement: 11776
 
-### 5B. SEO / contributor growth pack (Task B) — implemented
-- `README.md` — keyword H1 title, badges (stars, last commit, issues, CPU mode), table of contents, contributor path block, beta phase banner
-- `CONTRIBUTING.md` — CPU-only setup section added
-- `CODE_OF_CONDUCT.md` created (root)
-- `SECURITY.md` created (root; links to Docs/SECURITY.md)
-- `.github/PULL_REQUEST_TEMPLATE.md` created
-- `.github/labels.yml` created
-- `.github/config.yml` created (Discussions categories)
-- `docs/GOOD_FIRST_ISSUES.md` created — 15 issue drafts (>=10 no-gpu)
-- `docs/ARCHITECTURE_FOR_CONTRIBUTORS.md` created — folder map, request flow, where to add
-- `docs/GITHUB_SETUP.md` created — copy-paste values, topics, social preview spec
-- `docs/OUTREACH.md` created — post drafts, lists to submit, 30-day plan
-- Zero `pre-alpha`/`prealpha` references remain
-- Status: IMPLEMENTED (not pushed — pending user review)
+  trellis2_image_mesh_painting:
+    mesh_limits:
+      max_vertices: 500000
+      max_faces: 1000000
+    vram_requirement: 23552
 
-Output exact updates (replacement-only) for: `README.md`, `RULES.md`, `Docs/ARCHITECTURE.md`, `Docs/TASKS.md` (new rows: `5A` CPU setup mode, `5B` SEO/community pack), `Docs/CHANGELOG.md`, `Docs/MEMORY.md`, `Docs/DECISIONS.md` (ADR: "CPU mode skips model dependency installation by design"). Re-read all edited `.md` top-to-bottom, then bottom-to-top; list any gap found. End with the manual GitHub-UI checklist (max 10 lines).
+  hunyuan3d_paint_v21_image_mesh_painting:
+    mesh_limits:
+      max_vertices: 300000
+      max_faces: 600000
+    vram_requirement: 12000
+
+  paint3d:
+    mesh_limits:
+      max_vertices: 400000
+      max_faces: 800000
+    vram_requirement: 12000
+```
+
+## Phase-Wise Execution Plan
+
+### Phase 1: Post-Processing Hardening
+1. Unconditional `trimesh.repair.fill_holes()` after every mesh extraction — DONE for TRELLIS
+2. `fix_winding()` + `fix_normals()` unconditionally — DONE for TRELLIS
+3. Taubin smoothing `lamb=0.3, nu=-0.34, iterations=4` — DONE for TRELLIS (was 2, too gentle)
+4. Apply same repair to Hunyuan-Shape, Hunyuan-DiT, Hunyuan-Paint, TripoSG, Unique3D, Pixal3D, Hi3D adapters
+
+### Phase 2: Decimation & Retopology
+1. Curvature-aware decimation: protect crease angles (>35°), more polys on curved surfaces
+2. Target polycount presets: mobile 20K, game_ready 50K, cinematic 200K (from smart_presets.yaml)
+3. Quad-dominant retopology (AutoRetopo) with target face count
+4. Edge-preserving smoothing — protect sharp features while smoothing flat areas
+
+### Phase 3: Normal Map Baking
+1. High-poly → low-poly normal map bake (OpenGL Y+ tangent space)
+2. Cage/ray distance from quality.yaml (`cage_extrusion=0.02`, `max_ray_distance=0.05`)
+3. UV atlas utilization >= 60% (from quality.yaml)
+4. Packed RMA channels: roughness=G, metallic=B
+5. Flat face normal decode verification (~(0,0,1))
+
+### Phase 4: Frontend Quality UX
+1. QualityBadge: Sharp (feature edge retention >= 0.85), Clean (gate pass), Needs Review
+2. Telemetry: triangle count, non-manifold edges, holes, UV utilization
+3. Presets derived from backend smart_presets.yaml only (no hardcoded UI values)
+4. No inference sliders — adapter-owned
+5. No low-VRAM toggle — scheduler decides
+
+## Single Source of Truth (SSOT)
+- `backend/config/quality.yaml`: hole repair, decimation, gate thresholds, UV, bake, seeds, mesh.limits
+- `backend/config/smart_presets.yaml`: intent presets (mobile/game_ready/cinematic/animation/3d_print/native)
+- `backend/config/models.yaml`: VRAM, capabilities, model facts, mesh_limits per model
+- Frontend mirrors only via `constants/smartPresetFallback.json` guarded by parity test
+
+## Verification (Honest Reporting)
+- `bun tsc --noEmit`: frontend typecheck — NOT RUN YET
+- `python3 -m compileall backend/`: Python syntax — NOT RUN YET
+- `pytest backend/tests/`: backend contract tests — NOT RUN (no torch/GPU)
+- GPU inference / visual quality vs Tripo: NOT RUN (requires CUDA host + checkpoints)
+- Report as `NOT RUN`, never assume passing
+
+## What is NOT in this plan
+- Adapter inference profile changes — _LOCKED_INFERENCE_PROFILE stays as-is
+- SDF implementation — TripoSG's internal code
+- Scheduler pre-flight validation — not in Option A (limits enforced post-extraction)
+- Multi-view / Zero123++ — removed
+- Cloud, payment, mobile, social — out of scope
+
+## Current Dev Status — 2026-10-30
+
+- The shared post-processing path now includes the mesh-repair and raw-mesh-limit work recorded in the current `dev` history. The configured global guard is 500K vertices / 1M faces; it is applied after model extraction and before the immutable master is written.
+- **Important limitation:** a post-extraction cap is not a scheduler pre-flight budget. It cannot prevent every memory spike or OOM that occurs while a model is producing its raw mesh.
+- Hi3D is experimental. Its adapter profile is pinned to resolution `1024` and `25` inference steps. The caller seed remains configurable; request-side resolution and step overrides are ignored.
+- Model registration and checkpoint presence are not production-readiness proof. Some model pipelines are reported to fail during initialization/loading, while some others may complete with broken or unusable geometry. These reports are not yet mapped to a reproducible per-model failure matrix.
+- Hardware-backed inference, checkpoint loading, real peak VRAM, and visual quality verification must be recorded as `NOT RUN` until performed on the target CUDA environment.
+
+### Follow-up validation tasks
+
+1. Build a per-model startup matrix: dependency import, checkpoint completeness, pipeline initialization, target GPU, VRAM reservation, and failure traceback.
+2. Run representative image-to-mesh smoke tests for each enabled model and record whether the raw GLB loads, has finite vertices, valid face indices, connected components, holes, and non-manifold counts.
+3. Test post-processing separately from raw inference so adapter failures are not confused with pipeline failures.
+4. Save representative broken outputs and logs as regression fixtures where licensing and storage permit; add CPU-safe contract tests for each reproduced failure.
+5. Record GPU device/driver/CUDA/PyTorch versions, cold-load time, peak VRAM, inference time, and visual review before marking a model production-ready.
+
+See [MODEL-STATUS.md](MODEL-STATUS.md) for readiness definitions, current limitations, and the triage procedure.

@@ -23,36 +23,30 @@ from core.utils.mesh_utils import MeshProcessor
 logger = logging.getLogger(__name__)
 
 # LOCKED / ACTIVE: values used by inference.
-# BASELINE: previous effective runtime values (source_quality="max", pipeline_type="1536_cascade", max_num_tokens=524288, sampler params: sparse/100/10.0/0.9/8.0, shape/100/10.0/0.8/8.0, texture/100/3.5/0.5/8.0, decimation_target=-1, remesh=false, low_vram=false)
-# EXPERIMENTAL: selected experimental values, snapshot (2026-10-20) for stress-test; use only for benchmarking.
-# SUPPORTED BY: TRELLIS.2 adapter, EXPERIMENTAL-MODEL-SETTINGS.md section "TRELLIS.2 (raw/image geometry aliases)".
-# ROLLBACK: previous effective values; scheduler strips frontend overrides before adapter applies lock.
+# NOTE (DEBUGGING / FAST TESTING):
+# Output mesh 200-byte (faces=0) problem ke baad pipeline extraction aur mesh conversion logic ko
+# fast iterate & debug karne ke liye steps ko temporarily 1 par set kiya gaya hai.
+# IMPORTANT: Pipeline verify hone ke baad isse vapas 25 ya 50 steps par revert kiya jayega.
+# Ye step=1 setting sirf fast debug verification ke liye hai, 200-byte mesh issue setting low hone ki wajah se nahi tha!
 _LOCKED_INFERENCE_PROFILE = {
     "source_quality": "max",
     "pipeline_type": "1536_cascade",
     "max_num_tokens": 524288,
     "texture_size": 4096,
     "sparse_structure_sampler_params": {
-        "steps": 50,
+        "steps": 1,  # Temporary fast debug step (default: 25)
         "guidance_strength": 10.0,
         "guidance_rescale": 0.9,
         "rescale_t": 8.0,
     },
     "shape_slat_sampler_params": {
-        "steps": 50,
+        "steps": 1,  # Temporary fast debug step (default: 25)
         "guidance_strength": 10.0,
         "guidance_rescale": 0.8,
         "rescale_t": 8.0,
     },
-    "tex_slat_sampler_params": {
-        "steps": 50,
-        "guidance_strength": 3.5,
-        "guidance_rescale": 0.5,
-        "rescale_t": 8.0,
-    },
     "decimation_target": -1,
     "remesh": False,
-    "low_vram": False,
 }
 
 # LOCKED / ACTIVE: values used by inference (painting path only).
@@ -152,6 +146,21 @@ class Trellis2ImageToRawMeshAdapter(ImageToMeshModel):
             except Exception:
                 pass
 
+            # Pass explicit low_vram setting based on resource_plan or GPU memory (<20GB)
+            is_low_vram = False
+            if self.resource_plan:
+                strategy = str(self.resource_plan.get("strategy", ""))
+                if "low_vram" in strategy:
+                    is_low_vram = True
+            if not is_low_vram and torch.cuda.is_available():
+                try:
+                    target_gpu = self.gpu_id if self.gpu_id is not None else 0
+                    total_mb = torch.cuda.get_device_properties(target_gpu).total_memory / (1024 * 1024)
+                    if total_mb < 20480:
+                        is_low_vram = True
+                except Exception:
+                    pass
+
             # Initialize TRELLIS.2 runner
             from utils.trellis2_utils import Trellis2Runner
             self.runner = Trellis2Runner(
@@ -159,6 +168,7 @@ class Trellis2ImageToRawMeshAdapter(ImageToMeshModel):
                 model_cache_dir=str(self.model_path),
                 device=device,
                 resource_plan=self.resource_plan,
+                low_vram=is_low_vram,
             )
 
             # Pre-load the image-to-3D pipeline
@@ -234,32 +244,17 @@ class Trellis2ImageToRawMeshAdapter(ImageToMeshModel):
             remesh_project = inputs.get("remesh_project", 0)
             seed = inputs.get("seed", None)
             pipeline_type = str(inputs.get("pipeline_type") or "1536_cascade")
-            max_num_tokens = int(inputs.get("max_num_tokens", 262144))
-            steps = inputs.get("steps") or inputs.get("num_inference_steps")
-            default_steps = int(steps) if steps else 50
-            # EXPERIMENTAL_MAX_DETAIL defaults from the community TRELLIS.2 issue #92.
-            # This is a review candidate, not a universally proven optimum. Ask once before changing these defaults.
-            sparse_defaults = {
-                "steps": default_steps, "guidance_strength": 10.0,
-                "guidance_rescale": 0.7, "rescale_t": 6.0,
-            }
-            shape_defaults = {
-                "steps": default_steps, "guidance_strength": 10.0,
-                "guidance_rescale": 0.5, "rescale_t": 6.0,
-            }
-            texture_defaults = {
-                "steps": default_steps, "guidance_strength": 3.5,
-                "guidance_rescale": 0.2, "rescale_t": 6.0,
-            }
-            sparse_structure_sampler_params = inputs.get("sparse_structure_sampler_params") or sparse_defaults
-            shape_slat_sampler_params = inputs.get("shape_slat_sampler_params") or shape_defaults
-            tex_slat_sampler_params = inputs.get("tex_slat_sampler_params") or texture_defaults
+            max_num_tokens = int(inputs.get("max_num_tokens", _LOCKED_INFERENCE_PROFILE["max_num_tokens"]))
+            sparse_structure_sampler_params = inputs["sparse_structure_sampler_params"]
+            shape_slat_sampler_params = inputs["shape_slat_sampler_params"]
             
             logger.info(
                 "Generating high-fidelity untextured TRELLIS.2 mesh (pipeline=%s, max_num_tokens=%s, steps=%s)",
                 pipeline_type, max_num_tokens, sparse_structure_sampler_params.get("steps", 50),
             )
             
+            low_vram = inputs.get("low_vram") if inputs.get("low_vram") is not None else inputs.get("low_vram_mode")
+
             # Generate untextured raw 3D mesh
             mesh = self.runner.image_to_mesh(
                 image_path=image_path,
@@ -275,7 +270,7 @@ class Trellis2ImageToRawMeshAdapter(ImageToMeshModel):
                 max_num_tokens=max_num_tokens,
                 sparse_structure_sampler_params=sparse_structure_sampler_params,
                 shape_slat_sampler_params=shape_slat_sampler_params,
-                tex_slat_sampler_params=tex_slat_sampler_params,
+                low_vram=low_vram,
             )
             
             mesh_metadata = dict(getattr(mesh, "metadata", {}) or {})
@@ -321,6 +316,7 @@ class Trellis2ImageToRawMeshAdapter(ImageToMeshModel):
                     "max_num_tokens": max_num_tokens,
                     "sparse_structure_steps": sparse_structure_sampler_params.get("steps", "pipeline_default"),
                     "shape_slat_steps": shape_slat_sampler_params.get("steps", "pipeline_default"),
+                    "low_vram": getattr(getattr(self.runner, "image_to_3d_pipeline", None), "low_vram", low_vram),
                     "thumbnail_generated": thumbnail_generated,
                 }
             })

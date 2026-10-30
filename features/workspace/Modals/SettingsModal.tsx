@@ -86,7 +86,7 @@ export const SettingsModal: React.FC = () => {
       if (stats.status === 'online') {
         setTestResult({
           success: true,
-          msg: `Connected to ForMash 3D FastAPI backend (${latency}ms).`,
+          msg: `Connected to ForMesh 3D FastAPI backend (${latency}ms).`,
           latency,
         });
         refreshSystemStats();
@@ -579,16 +579,16 @@ export const SettingsModal: React.FC = () => {
                   onClick={() =>
                     setGenerationSettings((prev) => ({
                       ...prev,
-                      generatePBR: !prev.generatePBR,
+                      generateTexture: prev.generateTexture !== false ? false : true,
                     }))
                   }
                   className={`w-11 h-6 rounded-full transition-colors relative cursor-pointer ${
-                    generationSettings.generatePBR !== false ? 'bg-primary' : 'bg-zinc-700'
+                    generationSettings.generateTexture !== false ? 'bg-primary' : 'bg-zinc-700'
                   }`}
                 >
                   <div
                     className={`w-4 h-4 rounded-full bg-black absolute top-1 transition-transform ${
-                      generationSettings.generatePBR !== false ? 'left-6' : 'left-1'
+                      generationSettings.generateTexture !== false ? 'left-6' : 'left-1'
                     }`}
                   />
                 </button>

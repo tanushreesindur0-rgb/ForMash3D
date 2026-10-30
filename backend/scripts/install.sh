@@ -155,7 +155,7 @@ ensure_release_wheels() {
     echo "[INFO] Downloading release wheels to $WHEEL_DIR..."
     python3 -c '
 import urllib.request, json, os, sys
-req = urllib.request.Request("https://api.github.com/repos/Silentzx2/ForMash3D/releases/tags/Wheels", headers={"User-Agent": "ForMash3D-Installer"})
+req = urllib.request.Request("https://api.github.com/repos/Silentzx2/ForMesh3D/releases/tags/Wheels", headers={"User-Agent": "ForMash3D-Installer"})
 try:
     for a in json.loads(urllib.request.urlopen(req, timeout=30).read()).get("assets", []):
         if a["name"].endswith(".whl"):
@@ -714,7 +714,7 @@ fi
 
 # Keep datasets on the 3.x line: 4.x expects newer Hub bucket APIs than the shared
 # huggingface_hub==0.25.0 baseline. Match backend/requirements.txt.
-# ForMash3D calls the Unique3D inference components directly; it does not launch
+# ForMesh3D calls the Unique3D inference components directly; it does not launch
 # the upstream Gradio demo. Omit Gradio to avoid conflicting Hub/Pillow constraints.
 echo "[INFO] Installing remaining Unique3D requirements..."
 $UV_PIP install --find-links="$WHEEL_DIR" \
@@ -854,10 +854,36 @@ else
     echo "[WARN] TaoFlowForge thirdparty directory not found, skipping"
 fi
 
+### Hi3D Experimental Dependencies ###
+echo ""
+echo "========================================"
+echo "Installing Hi3D Dependencies (Experimental)"
+echo "========================================"
+if [ -d "$THIRDPARTY_DIR/Hi3D" ]; then
+    echo "[INFO] Found thirdparty/Hi3D directory..."
+    echo "[INFO] Installing Hi3D/Sparc3D requirements..."
+    $UV_PIP install --find-links="$WHEEL_DIR" \
+        ninja \
+        psutil \
+        triton>=3.1.0 \
+        einops || true
+
+    if [ "$COMPUTE_MODE" = "cuda" ] && command -v nvcc >/dev/null 2>&1; then
+        echo "[INFO] CUDA detected; checking flash-attn for Hi3D..."
+        if ! python3 -c "import flash_attn" >/dev/null 2>&1; then
+            $UV_PIP install --find-links="$WHEEL_DIR" flash-attn-*.whl || true
+        fi
+    fi
+    echo "[SUCCESS] Hi3D experimental dependencies processed"
+else
+    echo "[WARN] Hi3D thirdparty directory not found, skipping"
+fi
+### Hi3D end ###
+
 # huggingface_hub is managed centrally by backend/requirements.txt.
 
 # Older installer runs installed Gradio only for Unique3D's standalone demo.
-# ForMash3D uses FastAPI/Next.js and does not need these packages in its shared Hub 0.25 env.
+# ForMesh3D uses FastAPI/Next.js and does not need these packages in its shared Hub 0.25 env.
 echo "[INFO] Removing stale Unique3D Gradio UI packages (if present)..."
 $UV_PIP uninstall gradio gradio-client hf-gradio || true
 

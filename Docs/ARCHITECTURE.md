@@ -1,7 +1,7 @@
-# Architecture — ForMash 3D
+# Architecture — ForMesh 3D
 
 > **Architecture Version**: 0.1.0 (FastAPI + Next.js 16)
-> **Last Verified**: October 22, 2026
+> **Last Verified**: October 29, 2026
 > **Target Environments**: Linux (Ubuntu 20.04/22.04/24.04), Cloud GPU / Local Workstations
 
 ---
@@ -10,7 +10,7 @@
 
 ## 1. Architectural Mission & Overview
 
-ForMash 3D is an end-to-end generative 3D asset pipeline. The system is architected around a clean separation of concerns:
+ForMesh 3D is an end-to-end generative 3D asset pipeline. The system is architected around a clean separation of concerns:
 
 - **Presentation Layer**: Next.js 16 frontend with interactive Three.js 3D viewport, studio workspace tooling, persistent asset thumbnailing/previews, real-time hardware telemetry HUD, viewport background job capsule, and model management.
 - **API Gateway**: FastAPI backend (Python 3.10, Conda env `3daigc-api`) with VRAM-aware multiprocess scheduler, request validation, rate limiting, dual-store job synchronization (Redis + SQLite), and authorized artifact delivery.
@@ -34,7 +34,7 @@ Use this map to find the owner of a behavior before editing it. The generation U
 
 ### Generation runtime ownership
 
-The normal image-to-asset path is UI upload/request serialization → FastAPI validation and `JobRequest` → scheduler/resource planner → one adapter's inference → raw master persistence → optional `postprocess.pipeline.run_postprocess_job` → derivative artifacts and QA report. The scheduler owns worker/resource selection and job state; it does not implement mesh repair, retopology, baking, LOD, or collision algorithms. A request with post-processing disabled returns the raw result and bypasses those production stages.
+The normal image-to-asset path is UI upload/request serialization → FastAPI validation and `JobRequest` → scheduler/resource planner → one adapter's inference → raw master persistence → optional `postprocess.pipeline.run_postprocess_job` → derivative artifacts and QA report. An optional Hi3D refinement stage (`POST /mesh-generation/refine-mesh`) archives the source mesh as `<mesh>_legacy.glb`, then enqueues `hi3d_image_to_raw_mesh` with `coarse_mesh_path=<legacy>` so the adapter-owned Hi3D adapter refines the geometry without touching the immutable master. The scheduler owns worker/resource selection and job state; it does not implement mesh repair, retopology, baking, LOD, or collision algorithms. A request with post-processing disabled returns the raw result and bypasses those production stages.
 
 For a behavior change, update the owning implementation and its contract test first, then update the linked contract/API docs and verify the targeted CI command. Do not copy thresholds, model profiles, or intent recipes into a second owner.
 
@@ -43,8 +43,8 @@ For a behavior change, update the owning implementation and its contract test fi
 - Hunyuan3D-Shape-v2.1 locks the effective dev scheduler values in its adapter: octree resolution 1300, 150 steps, guidance 5.0, 80,000 chunks, and the native dense decoder with marching cubes. These are preserved runtime values, not a claim of GPU or quality validation; the resolution carries OOM risk.
 - TripoSG locks the effective dev scheduler values in its adapter: 100 steps, guidance 9.0, dense depth 10, hierarchical depth 11, and no Flash decoder. Its current depth resolver does not automatically downgrade from supplied VRAM estimates. GPU quality/VRAM benchmarking has not been performed for these settings.
 - Hunyuan3D-DiT-v2-mini-Turbo is adapter-owned like the other migrated profiles: its adapter locks octree resolution 768, 20 steps, guidance 7.5 and 80,000 chunks. These runtime values must not be retuned as a side effect.
-- TRELLIS locks 100 sparse/slat sampling steps, guidance 7.5 and `simplify=0.0` in its adapter; TRELLIS.2 locks the `1536_cascade` pipeline with a 524,288 max-token budget.
-- Pixal3D locks the `1536_cascade` pipeline at resolution 2048; Unique3D locks `input_processing=true`, `do_refine=true` and `expansion_weight=0.1`; TaoFlowForge locks `fill_holes=true` and `offload="auto"` for progressive native mesh generation.
+- TRELLIS locks 100 sparse/slat sampling steps, guidance 7.5 and `simplify=0.0` in its adapter; TRELLIS.2 keeps its `1536_cascade` geometry target and existing token budget, while the raw-mesh path skips texture-latent inference and decoding. The separate TRELLIS.2 painting adapter remains unchanged.
+- Pixal3D locks the `1536_cascade` pipeline at resolution 2048; Unique3D locks `input_processing=true`, `do_refine=true` and `expansion_weight=0.1`; TaoFlowForge locks `fill_holes=true` and `offload="auto"` for progressive native mesh generation. Unique3D's `fast_geo()` Screened Poisson initialization uses depth 7, matching the existing helper default; visual quality remains GPU-verification dependent.
 - The scheduler strips downstream-only target/decimation/remesh controls before adapter inference.
 - Raw extraction ceilings remain model-specific; only explicit hardware safety guards may lower them.
 - Normal image-to-3D routes return raw geometry; optional texture presets are handled after master promotion (Paint3D 1K/2K, Hunyuan3D-Paint 4K/8K). Legacy textured model IDs resolve to raw-generation aliases.
@@ -169,7 +169,7 @@ flowchart TD
   - `uv_island_count` (face-adjacency chart components when visual UVs are present)
   - `feature_edge_retention` (share of master edges with dihedral angle > 30.0° retained within angle/distance tolerance; 1.0 if no sharp edges or master is None)
   - Master immutability audit logic: `sha256_file` and `audit_master_immutability` guaranteeing working copies preserve exact SHA-256 master lineage.
-- `backend/core/quality/parity_scorecard.py`: Competitive benchmarking scorecard generator producing `parity_scorecard.json` across rows (`sharpness`, `topology_cleanliness`, `uv_quality`, `texture_quality`, `speed`, `failure_rate`) and columns (`ForMash3D`, `Tripo`, `Meshy`, `Hyper3D`).
+- `backend/core/quality/parity_scorecard.py`: Competitive benchmarking scorecard generator producing `parity_scorecard.json` across rows (`sharpness`, `topology_cleanliness`, `uv_quality`, `texture_quality`, `speed`, `failure_rate`) and columns (`ForMesh3D`, `Tripo`, `Meshy`, `Hyper3D`).
 
 ### Input Image Prep Module (Task 1B)
 - `backend/core/preprocess/image_enhancement.py`: Pillow/RealESRGAN preprocessing for 3D generation intake without mutating the source image; it writes an approved preprocessing artifact instead.
@@ -213,7 +213,7 @@ flowchart TD
 
 ### Final Parity Benchmark & Competitive Scorecard (Task 3D)
 - `scripts/run_final_parity_benchmark.py`: Evaluates canonical test shapes (cube, sphere, cylinder, mechanical prop) comparing raw baseline vs postprocessed meshes across triangle count, hole count, non-manifold edges, feature-edge retention, UV utilization, and PBR validation.
-- Output artifacts: `Docs/baseline_vs_now_benchmark.json` and `parity_scorecard.json` containing authoritative competitive comparisons across ForMash3D, Tripo, Meshy, and Hyper3D.
+- Output artifacts: `Docs/baseline_vs_now_benchmark.json` and `parity_scorecard.json` containing authoritative competitive comparisons across ForMesh3D, Tripo, Meshy, and Hyper3D.
 
 ```mermaid
 flowchart TB
@@ -359,7 +359,7 @@ Image-to-3D preprocessing tests for real transparency rather than alpha-channel 
 
 ### 2.5 Local Wheelhouse
 
-Prebuilt wheels are cached at `backend/thirdparty/wheels/` (inside the main ForMash3D repository). The `download_and_install_release_wheels()` function in `scripts/setup.sh` fetches all `.whl` files from the `ForMash3D/releases/tag/Wheels` GitHub Release and installs them. The install script (`backend/scripts/install.sh`) uses `--find-links="$WHEEL_DIR"` to prefer local prebuilt wheels when installing dependencies, falling back to PyPI/index/Git when no compatible wheel exists. Wheels are automatically downloaded from the ForMash3D GitHub Release at runtime into `backend/thirdparty/wheels/`.
+Prebuilt wheels are cached at `backend/thirdparty/wheels/` (inside the main ForMesh3D repository). The `download_and_install_release_wheels()` function in `scripts/setup.sh` fetches all `.whl` files from the `ForMesh3D/releases/tag/Wheels` GitHub Release and installs them. The install script (`backend/scripts/install.sh`) uses `--find-links="$WHEEL_DIR"` to prefer local prebuilt wheels when installing dependencies, falling back to PyPI/index/Git when no compatible wheel exists. Wheels are automatically downloaded from the ForMesh3D GitHub Release at runtime into `backend/thirdparty/wheels/`.
 
 ---
 
@@ -511,8 +511,10 @@ The only retained project runtime log is the repository-root `logs/master.log`. 
 - Docker Compose and `manager.sh docker-run` mount root `logs/` into `/app/logs`; Supervisor forwards Redis, scheduler, API and frontend output to the same append target.
 - The Admin Logs API and UI read only `master.log`. Clearing logs truncates the active file in place rather than unlinking it.
 - A remote Redis instance cannot write into the application host's local file; its server-side logs remain on the Redis host.
-- The /api/v1/system/logs/stream endpoint streams the complete master.log from byte 0 and then follows every appended write, emitting file-identity plus byte-offset event IDs. Chunks are forwarded without line parsing, so partial lines, CR/CRLF control characters and Unicode survive intact, and there is no line-count replay bound.
-- The Next.js SSE proxy sets X-Accel-Buffering: no and forwards upstream chunks directly. The Admin Logs tab batches live entries per animation frame, bounds pending/display history, and follows the latest line without repeated smooth-scroll animations.
+- A fresh request to `/api/v1/system/logs/stream` seeks to configured recent lines, then follows appended bytes; `tail=0` starts at EOF. The allowlisted `file` basename defaults to `master.log`; tail, scan size, idle backoff and heartbeat values are owned by `backend/config/system.yaml`.
+- Existing `identity:offset` SSE event IDs, `Last-Event-ID` reconnects and `reset` events remain byte-exact. The Next.js proxy preserves query/header forwarding, disables buffering and keeps cancellation attached until the stream ends.
+- Admin Logs uses SSE only; the dead WebSocket attempt and polling fallback are retired. The UI opens on recent history, resumes from the last consumed byte, batches appends per animation frame, and caps displayed history.
+- ponytail: `master.log` remains non-rotating because multiple Uvicorn workers write to the same file and Clear truncates it in place. If disk growth becomes an issue, use external log rotation with `copytruncate` or a multi-process-safe log handler.
 
 ### 6.4 Shutdown (`scripts/stop.sh`)
 - Gracefully terminates Next.js, Uvicorn, and Redis processes.
@@ -592,10 +594,12 @@ The active catalog is sourced from `backend/config/models.yaml`. Text-conditione
 | Pixal3D | `pixal3d_image_to_raw_mesh`; `pixal3d_image_to_3d` | Image → Raw Mesh (O-Voxel) | ~18 GB |
 | TaoFlowForge | `taoflowforge_image_to_raw_mesh` | Image → Raw Mesh (progressive native mesh) | ~20 GB; registered but disabled by default |
 
+**Readiness caveat:** this table describes manifest registration and declared resource budgets, not verified runtime readiness or mesh quality. A registered/enabled model can still fail checkpoint or pipeline initialization, and a completed inference can still produce invalid geometry. Current reported limitations and the model-by-model verification boundary are tracked in [MODEL-STATUS.md](MODEL-STATUS.md).
+
 ## 8.1 Raw Generation Fidelity / Official Parity Contract
 
 
-Raw generation is model-specific. ForMash3D does not apply one global inference-step contract because released models are tuned/distilled for different schedules.
+Raw generation is model-specific. ForMesh3D does not apply one global inference-step contract because released models are tuned/distilled for different schedules.
 
 ```
 model-specific inference settings

@@ -1,7 +1,34 @@
-# Architecture Decisions — ForMash 3D
+# Architecture Decisions — ForMesh 3D
 
 > **Version**: 0.1.0
-> **Last Updated**: September 2026
+> **Last Updated**: October 2026
+
+---
+
+## ADR-100: Logs — SSE-Only, Tail-First Start (2026-10-26)
+
+**Context:** The Admin Logs page replayed the full, non-rotating `master.log` from byte zero on each fresh open, attempted a WebSocket transport that could not upgrade through the Next.js catch-all route, raced SSE against a polling overwrite, allowed the DOM to grow without bound, and did not retry after an `EventSource.CLOSED` failure.
+
+**Decision:**
+1. Fresh SSE connections seek backward to the configured last N lines; `tail=0` starts at EOF. A strict `file` basename allowlist prevents paths from escaping the repository `logs/` directory.
+2. Preserve `identity:offset` event IDs, `Last-Event-ID` resume, UTF-8-safe chunks and `reset` events. One SSE transport replaces the dead WebSocket attempt and the redundant poll/overwrite path.
+3. Adapt idle polling using stream settings in `backend/config/system.yaml`; retain the configured heartbeat and avoid new dependencies or startup changes.
+4. Bound terminal history, reconnect closed streams with capped backoff, and keep the existing Clear operation on the canonical log.
+
+**Consequences:** History before the initial tail is not auto-replayed when the Logs tab opens; the query `tail` can request a larger configured window, and the existing log-file endpoint remains available for recent parsed entries. `master.log` still has no automatic rotation: multiple Uvicorn workers append to the same file and Clear truncates it in place. If disk growth becomes a concern, upgrade to external `copytruncate` rotation or a multi-process-safe handler.
+
+## ADR-099: Raw Mesh Fidelity Preservation and Worker Load Timeout Extension (2026-10-26)
+
+**Context:** Raw 3D meshes exported by AI model adapters exhibited melted/soft surfaces, lost high-frequency features (faces, hard surfaces, weapons), and suffered from 600s worker timeouts during large checkpoint initialization on cloud/Kaggle environments. Furthermore, TRELLIS 1 raw meshes exhibited jagged needle spikes and boundary holes.
+
+**Decision:**
+1. In `MeshProcessor.save_mesh`, make `crease_angle_deg=None` default so raw geometric normals are preserved without forced angle-weighted normal clustering.
+2. In Hunyuan3D-2.1 adapters and `hunyuan3d_decoder_profile.py`, enable `FlashVDM` decoder and support dynamic `dmc` (Dual Marching Cubes) when `diso` is present, with graceful `mc` fallback.
+3. In Unique3D `simple_clean_mesh`, disable Laplacian smoothing and Loop subdivision for raw geometry generation.
+4. In Pixal3D adapter, set `remesh=False` in `to_glb`.
+5. In TRELLIS.2 adapter, enforce `max_num_tokens=524288` to prevent automatic cascade resolution degradation.
+6. In TRELLIS 1 adapter, apply topological hole filling (`fill_holes`, winding, normal repairs) and gentle volume-preserving Taubin smoothing (`filter_taubin(lamb=0.3, nu=-0.34, iterations=2)`).
+7. In `multiprocess_scheduler.py`, extend default `max_load_timeout` for heavy models from 600s to 1800s.
 
 ---
 
@@ -22,3 +49,16 @@
 - CUDA/GPU inference still works on hosts with NVIDIA GPUs when run with `--gpu` or auto-detected CUDA.
 - Model adapters are importable at runtime only when their heavy ML dependencies were installed; a GPU-mode adapter used in CPU mode degrades gracefully at inference time rather than breaking setup.
 - Verification: `scripts/tests/script_test.sh` resolver tests + static grep test run in Backend Runtime Contract CI; `bash -n` passes on all edited scripts.
+
+
+## ADR-101: Separate Model Registration from Runtime and Output Readiness (2026-10-30)
+
+**Context:** The model manifest and `GET /system/models` expose enabled/registered model IDs, but deployments can still encounter missing or incompatible runtime dependencies, incomplete checkpoints, GPU/resource incompatibility, pipeline initialization failures, or invalid generated geometry.
+
+**Decision:**
+1. Treat catalog registration, checkpoint availability, pipeline initialization, successful inference, and mesh-quality validation as separate lifecycle states.
+2. Do not describe every enabled model as production-ready unless a supported-host load/inference smoke test and output-quality review are recorded for that model.
+3. Preserve initialization tracebacks in backend logs and expose actionable job/API error states; do not translate load failures into successful/empty mesh results.
+4. Track model-specific evidence and unresolved reports in `Docs/MODEL-STATUS.md`.
+
+**Consequences:** The available-model catalog remains a capability/manifest listing. Production readiness requires model-specific runtime and geometry evidence; CPU-only CI is not sufficient.

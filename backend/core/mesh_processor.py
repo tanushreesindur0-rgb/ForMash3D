@@ -1,4 +1,4 @@
-"""High-performance multi-threaded mesh processor for ForMash3D.
+"""High-performance multi-threaded mesh processor for ForMesh3D.
 
 Utilizes all available CPU cores (os.cpu_count()) for postprocessing,
 decimation, smoothing, marching cubes, and LOD generation operations.
@@ -220,26 +220,48 @@ def compute_angle_weighted_normals(
     has_vc = vc is not None and len(vc) == num_verts
     new_vc = list(vc) if has_vc else None
 
+    existing_normals: Optional[np.ndarray] = None
+    if hasattr(mesh, "_cache") and "vertex_normals" in mesh._cache:
+        try:
+            vn = np.asarray(mesh.vertex_normals, dtype=np.float64)
+            if len(vn) == num_verts and not np.allclose(vn, 0.0):
+                existing_normals = vn
+        except Exception:
+            existing_normals = None
+    elif hasattr(mesh, "vertex_normals"):
+        try:
+            vn = np.asarray(mesh.vertex_normals, dtype=np.float64)
+            if len(vn) == num_verts and not np.allclose(vn, 0.0):
+                existing_normals = vn
+        except Exception:
+            existing_normals = None
+
     for vi in range(num_verts):
         fc_list = vert_to_fc[vi]
         if not fc_list:
             continue
         if len(fc_list) == 1:
             fi, c_idx = fc_list[0]
-            vertex_normals_list[vi] = face_normals[fi].copy()
+            if existing_normals is not None:
+                vertex_normals_list[vi] = existing_normals[vi].copy()
+            else:
+                vertex_normals_list[vi] = face_normals[fi].copy()
             continue
 
         if not do_crease_split or not sharp_edges:
-            cluster_norm = np.zeros(3, dtype=np.float64)
-            for fi, corner in fc_list:
-                w = alphas[corner][fi]
-                cluster_norm += w * face_normals[fi]
-            norm_len = np.linalg.norm(cluster_norm)
-            if norm_len > 1e-12:
-                cluster_norm /= norm_len
+            if existing_normals is not None:
+                vertex_normals_list[vi] = existing_normals[vi].copy()
             else:
-                cluster_norm = face_normals[fc_list[0][0]]
-            vertex_normals_list[vi] = cluster_norm
+                cluster_norm = np.zeros(3, dtype=np.float64)
+                for fi, corner in fc_list:
+                    w = alphas[corner][fi]
+                    cluster_norm += w * face_normals[fi]
+                norm_len = np.linalg.norm(cluster_norm)
+                if norm_len > 1e-12:
+                    cluster_norm /= norm_len
+                else:
+                    cluster_norm = face_normals[fc_list[0][0]]
+                vertex_normals_list[vi] = cluster_norm
             continue
 
         local_edge_map: Dict[Tuple[int, int], List[int]] = {}
@@ -277,6 +299,10 @@ def compute_angle_weighted_normals(
                         cluster.append(nbr)
                         queue.append(nbr)
             clusters.append(cluster)
+
+        if len(clusters) == 1 and existing_normals is not None:
+            vertex_normals_list[vi] = existing_normals[vi].copy()
+            continue
 
         for c_idx, cluster in enumerate(clusters):
             target_v = vi if c_idx == 0 else len(new_vertices)
@@ -608,18 +634,50 @@ class MeshProcessor:
             return mesh
 
     @staticmethod
+    def _sanitize_mesh_nan(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+        """Replace NaN/Inf vertices with (0,0,0) so GLB accessor min/max are valid JSON.
+
+        NaN in vertex positions causes trimesh to write IEEE NaN into the GLB accessor
+        min/max arrays, which are invalid JSON and break any viewer that parses them.
+        """
+        if not isinstance(mesh, trimesh.Trimesh):
+            return mesh
+        v = mesh.vertices
+        if not np.any(~np.isfinite(v)):
+            return mesh
+        bad = ~np.isfinite(v).all(axis=1)
+        n_bad = bad.sum()
+        if n_bad > 0:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "Mesh has %d NaN/Inf vertices; replacing with (0,0,0) before export.", n_bad
+            )
+            v = v.copy()
+            v[bad] = 0.0
+            mesh = trimesh.Trimesh(vertices=v, faces=mesh.faces,
+                                   vertex_normals=mesh.vertex_normals if mesh.vertex_normals is not None and len(mesh.vertex_normals) else None,
+                                   process=False)
+        return mesh
+
+    @staticmethod
     def save_mesh(
         mesh: trimesh.Trimesh,
         output_path: Union[str, Path],
         format: str = "glb",
         do_normalise: bool = True,
-        crease_angle_deg: Optional[float] = 35.0,
+        crease_angle_deg: Optional[float] = None,
     ) -> Path:
         """Save a mesh to file with optimal angle-weighted normals and sharp edge preservation."""
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        if mesh is None:
+            raise ValueError(f"Cannot save None mesh to {output_path}: model generation produced a null mesh object.")
+
         try:
+            # Sanitize NaN/Inf before export — NaN in vertices produces NaN in GLB accessor
+            # min/max which is invalid JSON and breaks all 3D viewers.
+            mesh = MeshProcessor._sanitize_mesh_nan(mesh)
             if do_normalise:
                 mesh = MeshProcessor.normalise_mesh(mesh)
             if crease_angle_deg is not None and isinstance(mesh, trimesh.Trimesh) and len(mesh.faces) > 0:
@@ -641,6 +699,9 @@ class MeshProcessor:
         """Save a scene to file."""
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if mesh is None:
+            raise ValueError(f"Cannot save None mesh to {output_path}: model generation produced a null mesh object.")
 
         try:
             if do_normalise:

@@ -105,7 +105,7 @@ VERIFY_ONLY=false
 FORCE_DOWNLOAD=false
 
 # Available models
-AVAILABLE_MODELS=("hunyuan2mini" "hunyuan21" "hunyuan3d_shape_v21" "hunyuan3d_paint_v21" "hunyuan3d_dit_v2_mini_turbo" "trellis" "trellis-text" "trellis2" "unirig" "partuv" "fastmesh" "triposg" "ardy" "unique3d" "paint3d" "pixal3d" "taoflowforge" "misc" "all")
+AVAILABLE_MODELS=("hunyuan2mini" "hunyuan21" "hunyuan3d_shape_v21" "hunyuan3d_paint_v21" "hunyuan3d_dit_v2_mini_turbo" "trellis" "trellis-text" "trellis2" "unirig" "partuv" "fastmesh" "triposg" "ardy" "unique3d" "paint3d" "pixal3d" "taoflowforge" "hi3d" "misc" "all")
 
 show_help() {
     cat << EOF
@@ -138,6 +138,7 @@ Available models:
     paint3d            - Paint3D 1K/2K UV texture diffusion model
     pixal3d            - Pixal3D pixel-aligned image to 3D generation model
     taoflowforge       - TaoFlowForge progressive native mesh generation model (Alibaba)
+    hi3d               - Hi3D v1.0 high-resolution refinement model (Experimental)
     misc               - Miscellaneous utility models (RealESRGAN, DINOv2)
     all                - All core models (excluding optional normal ControlNet)
 
@@ -498,6 +499,10 @@ download_trellis2() {
     print_info "Downloading TRELLIS.2-4B model (image-based generation only)..."
     if hf_download  microsoft/TRELLIS.2-4B --local-dir "$model_dir"; then
         print_success "TRELLIS.2-4B model downloaded successfully"
+        print_info "Ensuring TRELLIS.2 image conditioning (DinoV3) model is cached..."
+        hf_download camenduru/dinov3-vitl16-pretrain-lvd1689m || true
+        print_info "Ensuring TRELLIS.2 background removal (BiRefNet) model is cached..."
+        hf_download ZhengPeng7/BiRefNet || true
     else
         print_error "Failed to download TRELLIS.2-4B model"
         return 1
@@ -682,9 +687,9 @@ download_unique3d() {
     local model_dir="$PRETRAINED_DIR/Unique3D"
     
     if [ "$FORCE_DOWNLOAD" = false ] && \
-       verify_directory "$model_dir/ckpt/controlnet-tile" 1 && \
-       verify_directory "$model_dir/ckpt/image2normal" 1 && \
-       verify_directory "$model_dir/ckpt/img2mvimg" 1 && \
+       verify_file "$model_dir/ckpt/controlnet-tile/diffusion_pytorch_model.safetensors" 100000000 && \
+       verify_file "$model_dir/ckpt/image2normal/unet/diffusion_pytorch_model.safetensors" 100000000 && \
+       verify_file "$model_dir/ckpt/img2mvimg/unet/diffusion_pytorch_model.safetensors" 100000000 && \
        verify_file "$model_dir/ckpt/realesrgan-x4.onnx" 50000000 && \
        verify_file "$model_dir/ckpt/v1-inference.yaml" 1000; then
         print_info "Unique3D model already exists and verified"
@@ -694,48 +699,13 @@ download_unique3d() {
     mkdir -p "$model_dir" 2>/dev/null || true
     ensure_writable_model_dir "$model_dir" || return 1
 
-    # Download controlnet-tile directory
-    print_info "Downloading Unique3D controlnet-tile..."
+    # Download all Unique3D checkpoints recursively from Wuvin/Unique3D space
+    print_info "Downloading Unique3D checkpoints (including UNet, VAE, ControlNet, ONNX)..."
     if ! hf_download --repo-type space Wuvin/Unique3D \
-        --include "ckpt/controlnet-tile/*" \
+        --include "ckpt/*" \
+        --include "ckpt/**/*" \
         --local-dir "$model_dir"; then
-        print_error "Failed to download controlnet-tile"
-        return 1
-    fi
-
-    # Download image2normal directory
-    print_info "Downloading Unique3D image2normal..."
-    if ! hf_download --repo-type space Wuvin/Unique3D \
-        --include "ckpt/image2normal/*" \
-        --local-dir "$model_dir"; then
-        print_error "Failed to download image2normal"
-        return 1
-    fi
-
-    # Download img2mvimg directory
-    print_info "Downloading Unique3D img2mvimg..."
-    if ! hf_download --repo-type space Wuvin/Unique3D \
-        --include "ckpt/img2mvimg/*" \
-        --local-dir "$model_dir"; then
-        print_error "Failed to download img2mvimg"
-        return 1
-    fi
-
-    # Download realesrgan-x4.onnx
-    print_info "Downloading Unique3D realesrgan-x4.onnx..."
-    if ! hf_download --repo-type space Wuvin/Unique3D \
-        --include "ckpt/realesrgan-x4.onnx" \
-        --local-dir "$model_dir"; then
-        print_error "Failed to download realesrgan-x4.onnx"
-        return 1
-    fi
-
-    # Download v1-inference.yaml
-    print_info "Downloading Unique3D v1-inference.yaml..."
-    if ! hf_download --repo-type space Wuvin/Unique3D \
-        --include "ckpt/v1-inference.yaml" \
-        --local-dir "$model_dir"; then
-        print_error "Failed to download v1-inference.yaml"
+        print_error "Failed to download Unique3D checkpoints"
         return 1
     fi
 
@@ -747,6 +717,57 @@ download_unique3d() {
 }
 
 # Function to download Pixal3D models
+pixal3d_checkpoint_complete() {
+    local model_dir="$1"
+    python3 - "$model_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+required = (
+    "sparse_structure_flow_model",
+    "sparse_structure_decoder",
+    "shape_slat_flow_model_512",
+    "shape_slat_flow_model_1024",
+    "shape_slat_decoder",
+    "tex_slat_flow_model_512",
+    "tex_slat_flow_model_1024",
+    "tex_slat_decoder",
+)
+try:
+    config = json.loads((root / "pipeline.json").read_text(encoding="utf-8"))
+    models = config["args"]["models"]
+    if not isinstance(models, dict):
+        raise ValueError("pipeline args.models is not an object")
+    for name in required:
+        relative_prefix = models.get(name)
+        if not isinstance(relative_prefix, str) or not relative_prefix:
+            raise ValueError(f"pipeline.json is missing model {name}")
+        prefix = Path(relative_prefix)
+        if not prefix.is_absolute():
+            prefix = root / prefix
+        config_path = Path(str(prefix) + ".json")
+        weights_path = Path(str(prefix) + ".safetensors")
+        if not config_path.is_file() or config_path.stat().st_size < 100:
+            raise ValueError(f"missing or truncated config for {name}: {config_path}")
+        if not weights_path.is_file() or weights_path.stat().st_size < 1000000:
+            raise ValueError(f"missing or truncated weights for {name}: {weights_path}")
+except Exception as exc:
+    print(f"Pixal3D checkpoint incomplete: {exc}", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+hf_encoder_weights_present() {
+    local model_dir="$1"
+    [ -f "$model_dir/config.json" ] || return 1
+    find "$model_dir" -maxdepth 1 -type f \
+        \( -name "*.safetensors" -o -name "pytorch_model*.bin" \) \
+        -size +1000000c -print -quit 2>/dev/null | grep -q .
+}
+
 download_pixal3d() {
     print_info "========================================"
     print_info "Downloading Pixal3D Model"
@@ -759,24 +780,28 @@ download_pixal3d() {
     if [ "$FORCE_DOWNLOAD" = false ] && \
        verify_directory "$model_dir" 1 && \
        verify_file "$model_dir/pipeline.json" 1000 && \
-       verify_file "$model_dir/sparse_structure_flow_model.safetensors" 1000000; then
-        print_info "Pixal3D model already exists and verified"
+       pixal3d_checkpoint_complete "$model_dir"; then
+        print_info "Pixal3D model already exists and all eight pipeline checkpoints are verified"
         return 0
     fi
 
     mkdir -p "$model_dir" 2>/dev/null || true
     ensure_writable_model_dir "$model_dir" || return 1
 
-    # Download the full Pixal3D model repo (pipeline.json + all safetensors)
+    # Download the full Pixal3D model repo (pipeline.json plus every model config and weight).
     print_info "Downloading Pixal3D model from Hugging Face (TencentARC/Pixal3D)..."
-    if ! hf_download TencentARC/Pixal3D \
-        --local-dir "$model_dir"; then
+    if ! hf_download TencentARC/Pixal3D --local-dir "$model_dir"; then
         print_error "Failed to download Pixal3D model"
         print_warning "The model requires ~18GB of weights. Check your disk space and network connection."
         return 1
     fi
 
-    print_success "Pixal3D model downloaded successfully"
+    if ! pixal3d_checkpoint_complete "$model_dir"; then
+        print_error "Pixal3D download did not produce all required pipeline checkpoints"
+        return 1
+    fi
+
+    print_success "Pixal3D model downloaded and verified successfully"
 }
 
 # Function to download Paint3D models
@@ -929,6 +954,88 @@ download_taoflowforge() {
     fi
 }
 
+# Function to download Hi3D model
+download_hi3d() {
+    print_info "========================================"
+    print_info "Downloading Hi3D Model (Experimental)"
+    print_info "========================================"
+
+    local model_dir="$PRETRAINED_DIR/Hi3D"
+    local weights_complete=false
+
+    if [ "$FORCE_DOWNLOAD" = false ] && \
+       verify_directory "$model_dir" 1 && \
+       verify_file "$model_dir/model_index.json" 100 && \
+       verify_file "$model_dir/scheduler/scheduler_config.json" 10 && \
+       verify_file "$model_dir/vae/config.json" 100 && \
+       verify_file "$model_dir/vae/model.safetensors" 1000000 && \
+       verify_file "$model_dir/transformer_512/config.json" 100 && \
+       verify_file "$model_dir/transformer_512/model.safetensors" 1000000 && \
+       verify_file "$model_dir/transformer_1024/config.json" 100 && \
+       verify_file "$model_dir/transformer_1024/model.safetensors" 1000000; then
+        weights_complete=true
+    fi
+
+    if [ "$weights_complete" = true ]; then
+        print_info "Hi3D checkpoint files already exist and are verified"
+    else
+        mkdir -p "$model_dir" 2>/dev/null || true
+        ensure_writable_model_dir "$model_dir" || return 1
+
+        print_info "Downloading Hi3D model from Hugging Face (hi3d-official/Hi3Dv1.0)..."
+        if ! hf_download hi3d-official/Hi3Dv1.0 --local-dir "$model_dir"; then
+            print_error "Failed to download Hi3D model"
+            print_warning "Hi3D requires ~8GB of weights. Check your disk space and network connection."
+            return 1
+        fi
+
+        if ! verify_file "$model_dir/model_index.json" 100 || \
+           ! verify_file "$model_dir/scheduler/scheduler_config.json" 10 || \
+           ! verify_file "$model_dir/vae/config.json" 100 || \
+           ! verify_file "$model_dir/vae/model.safetensors" 1000000 || \
+           ! verify_file "$model_dir/transformer_512/config.json" 100 || \
+           ! verify_file "$model_dir/transformer_512/model.safetensors" 1000000 || \
+           ! verify_file "$model_dir/transformer_1024/config.json" 100 || \
+           ! verify_file "$model_dir/transformer_1024/model.safetensors" 1000000; then
+            print_error "Hi3D download is incomplete; the custom Sparc3D loader requires all listed artifacts"
+            return 1
+        fi
+    fi
+
+    # Encoder downloads are mandatory for the local-only inference setup.
+    local dino_dir="$PRETRAINED_DIR/dinov2-large"
+    if ! hf_encoder_weights_present "$dino_dir"; then
+        mkdir -p "$dino_dir" 2>/dev/null || true
+        ensure_writable_model_dir "$dino_dir" || return 1
+        print_info "Downloading DINOv2-large vision encoder..."
+        if ! hf_download facebook/dinov2-large --local-dir "$dino_dir"; then
+            print_error "Failed to download DINOv2-large vision encoder"
+            return 1
+        fi
+    fi
+    if ! hf_encoder_weights_present "$dino_dir"; then
+        print_error "DINOv2-large download is incomplete"
+        return 1
+    fi
+
+    local clip_dir="$PRETRAINED_DIR/clip-vit-large-patch14"
+    if ! hf_encoder_weights_present "$clip_dir"; then
+        mkdir -p "$clip_dir" 2>/dev/null || true
+        ensure_writable_model_dir "$clip_dir" || return 1
+        print_info "Downloading CLIP-large vision encoder..."
+        if ! hf_download openai/clip-vit-large-patch14 --local-dir "$clip_dir"; then
+            print_error "Failed to download CLIP-large vision encoder"
+            return 1
+        fi
+    fi
+    if ! hf_encoder_weights_present "$clip_dir"; then
+        print_error "CLIP-large download is incomplete"
+        return 1
+    fi
+
+    print_success "Hi3D checkpoint weights and vision encoders verified successfully"
+}
+
 # Function to download miscellaneous models
 download_misc() {
     print_info "========================================"
@@ -1005,9 +1112,9 @@ verify_all_models() {
     verify_directory "$PRETRAINED_DIR/TRELLIS.2/TRELLIS.2-4B" 5 || all_verified=false
 
     print_info "Checking Unique3D..."
-    verify_directory "$PRETRAINED_DIR/Unique3D/ckpt/controlnet-tile" 1 || all_verified=false
-    verify_directory "$PRETRAINED_DIR/Unique3D/ckpt/image2normal" 1 || all_verified=false
-    verify_directory "$PRETRAINED_DIR/Unique3D/ckpt/img2mvimg" 1 || all_verified=false
+    verify_file "$PRETRAINED_DIR/Unique3D/ckpt/controlnet-tile/diffusion_pytorch_model.safetensors" 100000000 || all_verified=false
+    verify_file "$PRETRAINED_DIR/Unique3D/ckpt/image2normal/unet/diffusion_pytorch_model.safetensors" 100000000 || all_verified=false
+    verify_file "$PRETRAINED_DIR/Unique3D/ckpt/img2mvimg/unet/diffusion_pytorch_model.safetensors" 100000000 || all_verified=false
     verify_file "$PRETRAINED_DIR/Unique3D/ckpt/realesrgan-x4.onnx" 50000000 || all_verified=false
     verify_file "$PRETRAINED_DIR/Unique3D/ckpt/v1-inference.yaml" 1000 || all_verified=false
     
@@ -1036,6 +1143,11 @@ verify_all_models() {
     print_info "Checking TaoFlowForge..."
     if [ -d "$PRETRAINED_DIR/Taobao3D/TaoFlowForge" ]; then
         verify_directory "$PRETRAINED_DIR/Taobao3D/TaoFlowForge" 3 || all_verified=false
+    fi
+
+    print_info "Checking Hi3D..."
+    if [ -d "$PRETRAINED_DIR/Hi3D" ]; then
+        verify_directory "$PRETRAINED_DIR/Hi3D" 2 || all_verified=false
     fi
     
     if [ "$all_verified" = true ]; then
@@ -1126,6 +1238,9 @@ for model in "${MODELS_ARRAY[@]}"; do
             ;;
         "taoflowforge")
             download_taoflowforge
+            ;;
+        "hi3d")
+            download_hi3d
             ;;
         "misc")
             download_misc

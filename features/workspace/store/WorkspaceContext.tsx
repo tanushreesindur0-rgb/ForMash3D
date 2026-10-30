@@ -31,6 +31,7 @@ import {
   resolveGenerationModelCapabilities,
   resolveGenerationModelChoice,
 } from '../utils/buildGenerationParameters';
+import { buildTextureGenerationParameters } from '../utils/buildTextureGenerationParameters';
 import { DEFAULT_PHYSICS_SETTINGS } from '../utils/physicsSettings';
 import { taskPersistence } from '@/services/taskPersistence';
 
@@ -131,6 +132,7 @@ interface WorkspaceContextType {
   runUVUnwrapGeneration: (customSettings?: { distortionThreshold?: number; packMethod?: string; outputFormat?: string; saveIndividualParts?: boolean; modelParameters?: Record<string, any> }) => Promise<void>;
   runSegmentation: (customSettings?: { numParts?: number; method?: string; hierarchical?: boolean; outputFormat?: string; modelParameters?: Record<string, any>; modelPreference?: string } | number) => Promise<void>;
   runMeshEditing: (customSettings?: { sourcePrompt?: string; targetPrompt?: string; resolution?: number; bbox?: any; outputFormat?: string; mode?: 'text' | 'image'; targetImageFileId?: string; targetImageBase64?: string; strength?: number }) => Promise<void>;
+  refineMesh: (opts?: { meshPath?: string; imagePath?: string; resolution?: number }) => Promise<void>;
   processBatchQueue: () => Promise<void>;
   cancelBatchProcessing: () => Promise<void>;
   retryFailedBatchItems: () => Promise<void>;
@@ -549,7 +551,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const dismissActiveTask = useCallback(() => setActiveTask(null), []);
 
-    const [generationSettings, setGenerationSettings] = useState<GenerationSettings>({
+    const [generationSettings, setGenerationSettings] = useState<GenerationSettings>(() => ({
       mode: 'image-to-3d',
       image: null,
       aiModel: '',
@@ -579,7 +581,7 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       exportFormats: ['glb'],
       slicerHandoff: false,
       physics: { ...DEFAULT_PHYSICS_SETTINGS },
-    });
+    }));
  
    const [comparisonGroupId, setComparisonGroupId] = useState<string | null>(null);
  
@@ -594,9 +596,6 @@ export const WorkspaceProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     prompt: '',
     modelId: '',
     maps: { albedo: true, normal: true, roughness: true, metallic: true, ao: true, height: false },
-    maxNumView: 9,
-    generatePBR: true,
-    quadCompatibleUv: false,
   });
 
   const [sculptSettings, setSculptSettings] = useState<SculptSettings>({
@@ -1798,81 +1797,22 @@ function resolveMeshReference(asset?: ModelAsset | null): { mesh_file_id?: strin
   }, [remeshSettings, currentAsset, startTask]);
 
     const runTextureGeneration = useCallback(async () => {
-      const resolution = textureSettings.resolution || '2K';
-      const isHighRes = resolution === '4K' || resolution === '8K';
-      const modelPreference = isHighRes
+      const modelPreference = textureSettings.resolution === '4K' || textureSettings.resolution === '8K'
         ? 'hunyuan3d_paint_v21_image_mesh_painting'
         : 'paint3d';
 
       const localTaskId = startTask('texture', 'Texture generation', undefined, modelPreference, undefined, undefined, comparisonGroupId ?? undefined);
     try {
       const meshRef = resolveMeshReference(currentAsset);
-
-      const isTextPaintingModel = (modelPreference as string) === 'trellis_text_mesh_painting';
-      const hasTexturePrompt = Boolean(textureSettings.prompt?.trim());
-      const endpoint = isTextPaintingModel
-        ? '/api/v1/mesh-generation/text-mesh-painting'
-        : '/api/v1/mesh-generation/image-mesh-painting';
-
-      const numericResolution =
-        resolution === '1K' ? 1024 :
-        resolution === '2K' ? 2048 :
-        resolution === '4K' ? 4096 :
-        resolution === '8K' ? 8192 :
-        resolution === '512' ? 512 :
-        2048;
-
-      const body: Record<string, unknown> = {
-        texture_resolution: numericResolution,
-        texture_resolution_preset: resolution,
-        ...(textureSettings.quadCompatibleUv
-          ? { topology_mode: 'quad', quad_topology: true }
-          : {}),
-        output_format: 'glb',
-        model_preference: modelPreference,
-        enable_postprocess: false,
-        postprocess_mode: 'manual_mesh_tool',
-        ...meshRef,
-      };
-
-      if (modelPreference.includes('paint_v21') || isHighRes) {
-        body.model_parameters = {
-          // EXPERIMENTAL_MAX_DETAIL: Hunyuan3D-Paint upstream supports 6-9 views; default to 9.
-          // Ask the user once before changing this locked quality profile in a later task.
-          max_num_view: textureSettings.maxNumView ?? 9,
-          // EXPERIMENTAL_MAX_DETAIL: use the supported 768 per-view inference profile for both 4K and 8K atlas outputs.
-          // Atlas resolution remains selected independently below; ask the user before changing this locked quality default.
-          resolution: 768,
-        };
-      } else {
-        body.model_parameters = {};
-      }
-
-      if (textureSettings.generatePBR !== false) {
-        body.generate_pbr = true;
-      }
-
-      if (hasTexturePrompt && isTextPaintingModel) {
-        body.text_prompt = textureSettings.prompt;
-      } else {
-        const originalRefImage = currentAsset?.referenceImage || currentAsset?.inputImage || (currentAsset?.category === 'generation' ? currentAsset?.thumbnail : undefined);
-        const refImageUrl = textureSettings.referenceImage || originalRefImage;
-        if (!refImageUrl) {
-          throw new Error('No texture prompt or reference image provided. Please supply one.');
-        }
-        const refFileId = textureSettings.referenceImageFileId || currentAsset?.referenceImageFileId || (currentAsset as any)?.fileId;
-        if (refFileId) {
-          body.image_file_id = refFileId;
-        } else if (refImageUrl.startsWith('data:')) {
-          // Backend expects base64 WITHOUT the data-URL prefix
-          body.image_base64 = refImageUrl.replace(/^data:image\/[a-z0-9.+-]+;base64,/, '');
-        } else {
-          body.image_path = refImageUrl;
-        }
-        if (hasTexturePrompt) {
-          body.text_prompt = textureSettings.prompt;
-        }
-      }
+      const originalRefImage = currentAsset?.referenceImage || currentAsset?.inputImage || (currentAsset?.category === 'generation' ? currentAsset?.thumbnail : undefined);
+      const { endpoint, body } = buildTextureGenerationParameters(
+        textureSettings,
+        meshRef,
+        {
+          url: originalRefImage,
+          fileId: currentAsset?.referenceImageFileId || (currentAsset as any)?.fileId,
+        },
+      );
 
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -1899,7 +1839,7 @@ function resolveMeshReference(asset?: ModelAsset | null): { mesh_file_id?: strin
        setActiveTask(prev => prev ? { ...prev, status: 'failed', currentStep: message, errorMessage: message, diagnostic } : null);
        toast.error('Texture generation failed', { description: message });
      }
-   }, [textureSettings, currentAsset, startTask]);
+    }, [textureSettings, currentAsset, startTask]);
 
     const runUVUnwrapGeneration = useCallback(async (customSettings?: {
      distortionThreshold?: number;
@@ -2056,6 +1996,42 @@ function resolveMeshReference(asset?: ModelAsset | null): { mesh_file_id?: strin
       toast.error('Mesh editing failed', { description: message });
     }
   }, [currentAsset, startTask]);
+
+  const refineMesh = useCallback(async (opts: { meshPath?: string; imagePath?: string; resolution?: number } = {}) => {
+    const asset = currentAsset;
+    if (!asset) {
+      toast.error('Refine failed', { description: 'No mesh loaded.' });
+      return;
+    }
+    const meshPath = opts.meshPath ?? asset.source?.viewUrl ?? asset.artifacts?.gameReady ?? asset.artifacts?.source ?? asset.thumbnail;
+    if (!meshPath) {
+      toast.error('Refine failed', { description: 'This mesh has no backend URL to refine.' });
+      return;
+    }
+
+    const localTaskId = startTask('refine', 'Refine with Hi3D');
+
+    try {
+      const data = await getApiClient().refineMesh({
+        jobId: asset.id,
+        meshPath,
+        imagePath: opts.imagePath ?? asset.referenceImage ?? asset.inputImage,
+        resolution: opts.resolution,
+      });
+      bindBackendJob(localTaskId, data.refinement_job_id, {
+        status: 'queued',
+        currentStep: 'Refining geometry with Hi3D...',
+      });
+      setExecutionStep('Refining geometry with Hi3D...');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Refine submission failed';
+      setIsExecuting(false);
+      setExecutionProgress(0);
+      setExecutionStep(message);
+      setActiveTask(prev => (prev ? { ...prev, status: 'failed', currentStep: message, errorMessage: message } : null));
+      toast.error('Refine failed', { description: message });
+    }
+  }, [currentAsset, startTask, bindBackendJob]);
 
    // Batch processing function
     const processBatchQueue = useCallback(async () => {
@@ -2500,6 +2476,7 @@ function resolveMeshReference(asset?: ModelAsset | null): { mesh_file_id?: strin
       runRemeshGeneration, runTextureGeneration,
       runUVUnwrapGeneration, runSegmentation,
       runMeshEditing,
+      refineMesh,
       processBatchQueue,
       cancelBatchProcessing,
       retryFailedBatchItems,
@@ -2507,6 +2484,7 @@ function resolveMeshReference(asset?: ModelAsset | null): { mesh_file_id?: strin
       runRemeshGeneration, runTextureGeneration,
       runUVUnwrapGeneration, runSegmentation,
       runMeshEditing,
+      refineMesh,
       processBatchQueue,
       cancelBatchProcessing,
       retryFailedBatchItems]);

@@ -94,6 +94,7 @@ class Trellis2Runner:
         model_cache_dir: Optional[str] = None,
         device: str = "cuda",
         resource_plan: Optional[Dict[str, Any]] = None,
+        low_vram: Optional[bool] = None,
     ):
         """
         Initialize TRELLIS.2 runner.
@@ -102,6 +103,8 @@ class Trellis2Runner:
             trellis2_root: Path to thirdparty/TRELLIS.2 directory
             model_cache_dir: Path to model cache directory
             device: Device to run on ('cuda' or 'cpu')
+            resource_plan: Hardware allocation plan from scheduler
+            low_vram: If True, uses sequential offloading (<= 15GB VRAM). If False, runs full 24GB pipeline in VRAM.
         """
         if trellis2_root is None:
             trellis2_root = os.path.join(
@@ -111,6 +114,23 @@ class Trellis2Runner:
         self.trellis2_root = Path(trellis2_root)
         self.device = device
         self.resource_plan = dict(resource_plan or {})
+
+        # Resolve low_vram mode: explicit param > scheduler strategy > hardware detection (<20GB)
+        if low_vram is not None:
+            self.low_vram = bool(low_vram)
+        elif self.resource_plan.get("strategy") == "single_gpu_low_vram":
+            self.low_vram = True
+        else:
+            low_vram_needed = False
+            if torch.cuda.is_available():
+                try:
+                    dev_idx = int(self.device.split(":")[-1]) if ":" in str(self.device) else (torch.cuda.current_device() if str(self.device).startswith("cuda") else 0)
+                    total_mb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024 * 1024)
+                    if total_mb < 20480:
+                        low_vram_needed = True
+                except Exception:
+                    low_vram_needed = True
+            self.low_vram = low_vram_needed
         
         if model_cache_dir is None:
             model_cache_dir = os.path.join(
@@ -163,27 +183,52 @@ class Trellis2Runner:
             logger.info("Loading TRELLIS.2 image-to-3D pipeline...")
             from trellis2.pipelines import Trellis2ImageTo3DPipeline
             
-            pretrained_path = str(self.model_cache_dir) if (self.model_cache_dir / "pipeline.json").exists() else "microsoft/TRELLIS.2-4B"
+            # Resolve checkpoint directory checking TRELLIS.2-4B subdirectory
+            candidates = [
+                self.model_cache_dir / "TRELLIS.2-4B",
+                self.model_cache_dir,
+                Path(__file__).resolve().parents[1] / "pretrained" / "TRELLIS.2" / "TRELLIS.2-4B",
+                Path(__file__).resolve().parents[1] / "pretrained" / "TRELLIS.2",
+                Path(__file__).resolve().parents[2] / "pretrained" / "TRELLIS.2" / "TRELLIS.2-4B",
+                Path(__file__).resolve().parents[2] / "pretrained" / "TRELLIS.2",
+            ]
+            if os.environ.get("PRETRAINED_DIR"):
+                p_dir = Path(os.environ["PRETRAINED_DIR"])
+                candidates.extend([p_dir / "TRELLIS.2" / "TRELLIS.2-4B", p_dir / "TRELLIS.2"])
+
+            resolved_path = None
+            for c in candidates:
+                if (c / "pipeline.json").is_file():
+                    ckpts_dir = c / "ckpts"
+                    if (ckpts_dir.is_dir() and any(ckpts_dir.iterdir())) or any(c.glob("*.safetensors")):
+                        resolved_path = str(c.resolve())
+                        break
+
+            pretrained_path = resolved_path or "microsoft/TRELLIS.2-4B"
+            logger.info(f"Loading TRELLIS.2 image-to-3D pipeline from: {pretrained_path}")
             self.image_to_3d_pipeline = Trellis2ImageTo3DPipeline.from_pretrained(
                 pretrained_path
             )
 
-            # Auto-detect low-VRAM mode when single GPU has < 20GB VRAM
-            low_vram_needed = False
-            if torch.cuda.is_available():
+            # Auto-align sparse structure decoder input dtype with weights and guard native C++ extensions
+            try:
+                from utils.torchvision_fix import fix_trellis2_sparse_vae_dtype, fix_trellis2_flexible_dual_grid, fix_trellis2_cumesh_fallback
+                fix_trellis2_sparse_vae_dtype()
+                fix_trellis2_flexible_dual_grid()
+                fix_trellis2_cumesh_fallback()
+            except Exception as patch_err:
                 try:
-                    dev_idx = int(self.device.split(":")[-1]) if ":" in str(self.device) else (torch.cuda.current_device() if str(self.device).startswith("cuda") else 0)
-                    total_mb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024 * 1024)
-                    strategy = self.resource_plan.get("strategy", "")
-                    if total_mb < 20480 or strategy == "single_gpu_low_vram":
-                        low_vram_needed = True
+                    from backend.utils.torchvision_fix import fix_trellis2_sparse_vae_dtype, fix_trellis2_flexible_dual_grid, fix_trellis2_cumesh_fallback
+                    fix_trellis2_sparse_vae_dtype()
+                    fix_trellis2_flexible_dual_grid()
+                    fix_trellis2_cumesh_fallback()
                 except Exception:
-                    pass
+                    logger.debug(f"fix_trellis2 notice: {patch_err}")
 
-            if low_vram_needed and len(self.resource_plan.get("gpu_ids", [])) <= 1:
+            if self.low_vram:
                 self.image_to_3d_pipeline.low_vram = True
                 self.image_to_3d_pipeline._device = self.device
-                logger.info(f"TRELLIS.2 enabled low-VRAM mode (sequential offload) on {self.device} while preserving full fidelity")
+                logger.info(f"TRELLIS.2 enabled low-VRAM mode (sequential offload <= 15GB) on {self.device} while preserving full fidelity")
             elif len(self.resource_plan.get("gpu_ids", [])) > 1:
                 from core.scheduler.resource_planner import ResourcePlan, dispatch_pipeline_across_gpus
                 dispatch_pipeline_across_gpus(
@@ -212,6 +257,11 @@ class Trellis2Runner:
                     self.image_to_3d_pipeline.image_cond_model.to(self.device)
                 if getattr(self.image_to_3d_pipeline, "rembg_model", None) is not None:
                     self.image_to_3d_pipeline.rembg_model.to(self.device)
+
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             logger.info("TRELLIS.2 image-to-3D pipeline loaded successfully")
             
@@ -228,27 +278,45 @@ class Trellis2Runner:
             logger.info("Loading TRELLIS.2 texturing pipeline...")
             from trellis2.pipelines import Trellis2TexturingPipeline
             
+            # Resolve checkpoint directory checking TRELLIS.2-4B subdirectory
+            candidates = [
+                self.model_cache_dir / "TRELLIS.2-4B",
+                self.model_cache_dir,
+                Path(__file__).resolve().parents[1] / "pretrained" / "TRELLIS.2" / "TRELLIS.2-4B",
+                Path(__file__).resolve().parents[1] / "pretrained" / "TRELLIS.2",
+                Path(__file__).resolve().parents[2] / "pretrained" / "TRELLIS.2" / "TRELLIS.2-4B",
+                Path(__file__).resolve().parents[2] / "pretrained" / "TRELLIS.2",
+            ]
+            if os.environ.get("PRETRAINED_DIR"):
+                p_dir = Path(os.environ["PRETRAINED_DIR"])
+                candidates.extend([p_dir / "TRELLIS.2" / "TRELLIS.2-4B", p_dir / "TRELLIS.2"])
+
+            resolved_path = None
+            for c in candidates:
+                if (c / "texturing_pipeline.json").is_file():
+                    ckpts_dir = c / "ckpts"
+                    if (ckpts_dir.is_dir() and any(ckpts_dir.iterdir())) or any(c.glob("*.safetensors")):
+                        resolved_path = str(c.resolve())
+                        break
+
+            tex_model_path = resolved_path or "microsoft/TRELLIS.2-4B"
             self.texturing_pipeline = Trellis2TexturingPipeline.from_pretrained(
-                "microsoft/TRELLIS.2-4B",
+                tex_model_path,
                 config_file="texturing_pipeline.json"
             )
-            if len(self.resource_plan.get("gpu_ids", [])) > 1:
-                from core.scheduler.resource_planner import ResourcePlan, dispatch_pipeline_across_gpus
-                dispatch_pipeline_across_gpus(
-                    self.texturing_pipeline,
-                    ResourcePlan(
-                        kind="multi_gpu",
-                        gpu_ids=tuple(int(x) for x in self.resource_plan["gpu_ids"]),
-                        primary_gpu=int(self.resource_plan["gpu_ids"][0]),
-                        reservation_mb={int(k): int(v) for k, v in self.resource_plan.get("reservation_mb", {}).items()},
-                        max_memory_mb={str(k): int(v) for k, v in self.resource_plan.get("max_memory_mb", {}).items()},
-                        cpu_threads=int(self.resource_plan.get("cpu_threads", 1)),
-                        strategy=str(self.resource_plan.get("strategy", "accelerate_component_dispatch")),
-                        reason=str(self.resource_plan.get("reason", "scheduler resource plan")),
-                    ),
-                )
+            if self.low_vram:
+                self.texturing_pipeline.low_vram = True
+                self.texturing_pipeline._device = self.device
+                logger.info(f"TRELLIS.2 enabled low-VRAM mode for texturing on {self.device}")
             elif str(self.device).startswith("cuda"):
+                self.texturing_pipeline.low_vram = False
                 self.texturing_pipeline.to(self.device)
+                logger.info(f"TRELLIS.2 enabled full 24GB mode for texturing on {self.device}")
+
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             logger.info("TRELLIS.2 texturing pipeline loaded successfully")
             
@@ -299,10 +367,11 @@ class Trellis2Runner:
         verbose: bool = True,
         raw_mesh_only: bool = True,
         pipeline_type: str = "1536_cascade",
-        max_num_tokens: int = 262144,
+        max_num_tokens: int = 524288,
         sparse_structure_sampler_params: Optional[Dict[str, Any]] = None,
         shape_slat_sampler_params: Optional[Dict[str, Any]] = None,
         tex_slat_sampler_params: Optional[Dict[str, Any]] = None,
+        low_vram: Optional[bool] = None,
     ) -> trimesh.Trimesh:
         """
         Generate 3D mesh from image using TRELLIS.2.
@@ -322,11 +391,21 @@ class Trellis2Runner:
             sparse_structure_sampler_params: Model sampler overrides for sparse structure.
             shape_slat_sampler_params: Model sampler overrides for geometry latents.
             tex_slat_sampler_params: Model sampler overrides for texture latents.
+            low_vram: If True, sequentially offloads models between CPU and GPU (<=15GB VRAM). If False, runs full 24GB pipeline in VRAM.
         
         Returns:
             Generated trimesh.Trimesh object
         """
         self._load_image_to_3d_pipeline()
+
+        # Dynamic low_vram mode switch per request
+        if low_vram is not None and hasattr(self.image_to_3d_pipeline, "low_vram"):
+            req_low_vram = bool(low_vram)
+            if self.image_to_3d_pipeline.low_vram != req_low_vram:
+                self.image_to_3d_pipeline.low_vram = req_low_vram
+                if not req_low_vram and str(self.device).startswith("cuda"):
+                    self.image_to_3d_pipeline.to(self.device)
+                logger.info(f"TRELLIS.2 switched low_vram={req_low_vram} for request")
         
         # Load image
         image = Image.open(image_path)
@@ -342,14 +421,24 @@ class Trellis2Runner:
             "Generating TRELLIS.2 mesh from image: %s (pipeline=%s, max_num_tokens=%s)",
             image_path, pipeline_type, max_num_tokens,
         )
+        try:
+            from utils.torchvision_fix import fix_flex_gemm
+            fix_flex_gemm()
+        except Exception:
+            try:
+                from backend.utils.torchvision_fix import fix_flex_gemm
+                fix_flex_gemm()
+            except Exception:
+                pass
         pipeline_result = self.image_to_3d_pipeline.run(
             image,
             seed=42 if seed is None else int(seed),
             pipeline_type=pipeline_type,
             max_num_tokens=int(max_num_tokens),
-            sparse_structure_sampler_params=dict(sparse_structure_sampler_params or {"steps": 50}),
-            shape_slat_sampler_params=dict(shape_slat_sampler_params or {"steps": 50}),
-            tex_slat_sampler_params=dict(tex_slat_sampler_params or shape_slat_sampler_params or {"steps": 50}),
+            sparse_structure_sampler_params=dict(sparse_structure_sampler_params or {}),
+            shape_slat_sampler_params=dict(shape_slat_sampler_params or {}),
+            tex_slat_sampler_params=dict(tex_slat_sampler_params or {}),
+            geometry_only=raw_mesh_only,
             return_latent=True,
         )
         mesh, effective_resolution, voxel_size, resolution_source = (
@@ -410,6 +499,12 @@ class Trellis2Runner:
             logger.info("Extracting untextured raw mesh (texture baking skipped)")
             verts = mesh.vertices.cpu().numpy() if hasattr(mesh.vertices, 'cpu') else np.array(mesh.vertices)
             faces = mesh.faces.cpu().numpy() if hasattr(mesh.faces, 'cpu') else np.array(mesh.faces)
+            # Replace NaN/Inf vertices: GLB accessor min/max with NaN is invalid JSON and breaks viewers
+            bad = ~np.isfinite(verts).all(axis=1)
+            if bad.any():
+                logger.warning("TRELLIS.2 raw mesh has %d NaN/Inf vertices; replacing with (0,0,0)", bad.sum())
+                verts = verts.copy()
+                verts[bad] = 0.0
             raw_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
             raw_mesh.metadata.update(mesh_metadata)
             return raw_mesh
@@ -471,7 +566,8 @@ class Trellis2Runner:
         mesh_path: str,
         image_path: str,
         output_format: str = "glb",
-        extension_webp: bool = True
+        extension_webp: bool = True,
+        low_vram: Optional[bool] = None,
     ) -> trimesh.Trimesh:
         """
         Apply texture to mesh using image guidance.
@@ -481,11 +577,21 @@ class Trellis2Runner:
             image_path: Path to reference image for texturing
             output_format: Output format ('glb' or 'obj')
             extension_webp: Whether to use WebP extension in GLB
+            low_vram: If True, uses sequential offloading (<= 15GB VRAM). If False, runs full 24GB pipeline in VRAM.
         
         Returns:
             Textured trimesh.Trimesh object
         """
         self._load_texturing_pipeline()
+
+        # Dynamic low_vram switch for texturing
+        if low_vram is not None and hasattr(self.texturing_pipeline, "low_vram"):
+            req_low_vram = bool(low_vram)
+            if self.texturing_pipeline.low_vram != req_low_vram:
+                self.texturing_pipeline.low_vram = req_low_vram
+                if not req_low_vram and str(self.device).startswith("cuda"):
+                    self.texturing_pipeline.to(self.device)
+                logger.info(f"TRELLIS.2 switched texturing low_vram={req_low_vram} for request")
         
         # Load mesh and image
         mesh = trimesh.load(mesh_path, force="mesh")

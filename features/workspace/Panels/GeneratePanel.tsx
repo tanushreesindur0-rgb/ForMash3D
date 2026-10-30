@@ -267,6 +267,7 @@ export const QualityBadge: React.FC<QualityBadgeProps> = React.memo(({
     </SimpleTooltip>
   );
 });
+QualityBadge.displayName = 'QualityBadge';
 
 interface DiscoveredModel {
   id: string;
@@ -323,6 +324,8 @@ function formatGenerateModel(
   else if (id === 'trellis2_image_to_raw_mesh' || id === 'trellis2_image_to_textured_mesh') cleanLabel = 'TRELLIS 2 (Next-Gen 4B)';
   else if (id === 'trellis_image_to_raw_mesh') cleanLabel = 'TRELLIS (Raw Geometry)';
   else if (id === 'unique3d_image_to_raw_mesh') cleanLabel = 'Unique3D (High-Fidelity Diffusion)';
+  else if (id === 'hi3d_image_to_raw_mesh') cleanLabel = 'Hi3D [Experimental] (High-Res Geometry)';
+  else if (id === 'hi3d_image_to_textured_mesh') cleanLabel = 'Hi3D [Experimental] (Refined Mesh)';
 
   return {
     id,
@@ -494,6 +497,7 @@ export const GeneratePanel: React.FC = () => {
       'hunyuan3d_shape_v21_image_to_raw_mesh',
       'hunyuan3d_dit_v2_mini_turbo_image_to_raw_mesh',
       'unique3d_image_to_raw_mesh',
+      'hi3d_image_to_raw_mesh',
     ];
     ids = combined.length > 0 ? combined : defaults;
 
@@ -2017,7 +2021,7 @@ export const GeneratePanel: React.FC = () => {
               </div>
             </div>
 
-            {/* Topology & Normal-Map Baking */}
+             {/* Topology & Normal-Map Baking */}
             <div className={`rounded-xl border bg-[hsl(var(--surface-0))] p-2.5 space-y-2.5 transition-all ${
               isPostprocessOff ? 'border-white/[0.06] opacity-60' : 'border-white/[0.1]'
             }`}>

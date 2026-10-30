@@ -13,7 +13,7 @@ import sys
 import uuid
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -26,31 +26,65 @@ from core.utils.mesh_utils import MeshProcessor
 
 logger = logging.getLogger(__name__)
 
+
+_PIXAL_INFERENCE_MODULE_NAME = "_formesh3d_pixal3d_inference"
+
+
+def _load_pixal3d_inference_module(pixal3d_root: Path) -> Optional[Any]:
+    """Load camera helpers from the custom Pixal3D checkout under a collision-safe name."""
+    import importlib.util
+
+    inference_path = (Path(pixal3d_root) / "inference.py").resolve()
+    if not inference_path.is_file():
+        return None
+
+    cached = sys.modules.get(_PIXAL_INFERENCE_MODULE_NAME)
+    cached_path = getattr(cached, "__file__", None) if cached is not None else None
+    if cached_path and Path(cached_path).resolve() == inference_path:
+        return cached
+
+    spec = importlib.util.spec_from_file_location(
+        _PIXAL_INFERENCE_MODULE_NAME, str(inference_path)
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load Pixal3D inference helpers from {inference_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_PIXAL_INFERENCE_MODULE_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_PIXAL_INFERENCE_MODULE_NAME, None)
+        raise
+    return module
+
 # LOCKED / ACTIVE: values used by inference.
 # BASELINE: previous effective runtime values (source_quality="max", resolution=2048, pipeline_type="1536_cascade", sampler_overrides: sparse_structure/100/10.0/0.9/8.0, shape/100/10.0/0.8/8.0, texture/100/3.5/0.5/8.0, low_vram=false)
 # EXPERIMENTAL: selected experimental values, snapshot (2026-10-20) for stress-test; use only for benchmarking.
 # SUPPORTED BY: Pixal3D adapter, EXPERIMENTAL-MODEL-SETTINGS.md section "Pixal3D".
 # ROLLBACK: previous effective values; scheduler strips frontend overrides before adapter applies lock.
+# SHORTCUT / PIPELINE STABILITY TEST: Low resolution (512) and 1 step for ultra-fast validation (~5s).
+# AFTER PIPELINE IS STABLE: Change "resolution" back to 2048 and sampler "steps" back to 100!
 _LOCKED_INFERENCE_PROFILE = {
     "source_quality": "max",
-    "resolution": 2048,
+    "resolution": 512,  # AFTER PIPELINE IS STABLE: Change back to 2048
     "pipeline_type": "1536_cascade",
     "max_num_tokens": 524288,
     "sampler_overrides": {
         "sparse_structure": {
-            "steps": 100,
+            "steps": 1,  # AFTER PIPELINE IS STABLE: Change back to 100
             "guidance_strength": 10.0,
             "guidance_rescale": 0.9,
             "rescale_t": 8.0,
         },
         "shape": {
-            "steps": 100,
+            "steps": 1,  # AFTER PIPELINE IS STABLE: Change back to 100
             "guidance_strength": 10.0,
             "guidance_rescale": 0.8,
             "rescale_t": 8.0,
         },
         "texture": {
-            "steps": 100,
+            "steps": 1,  # AFTER PIPELINE IS STABLE: Change back to 100
             "guidance_strength": 3.5,
             "guidance_rescale": 0.5,
             "rescale_t": 8.0,
@@ -146,6 +180,30 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
 
             self._ensure_pixal3d_in_path()
 
+            # Put Hugging Face and Torch Hub caches under the project pretrained tree.
+            # Model inference must not depend on ~/.cache being writable in containers.
+            if self.model_path.is_absolute() or self.model_path.exists():
+                cache_root = self.model_path.parent.resolve()
+            else:
+                cache_root = (Path(__file__).resolve().parents[1] / "pretrained").resolve()
+            hf_cache_dir = cache_root / "huggingface"
+            torch_hub_cache_dir = cache_root / "torch_hub"
+            try:
+                for cache_dir in (hf_cache_dir, torch_hub_cache_dir):
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    probe = cache_dir / (".write-check-" + uuid.uuid4().hex)
+                    try:
+                        probe.write_bytes(b"ok")
+                    finally:
+                        probe.unlink(missing_ok=True)
+            except OSError as cache_err:
+                raise PermissionError(
+                    f"Pixal3D requires writable model cache directories under {cache_root}: {cache_err}"
+                ) from cache_err
+
+            import torch.hub
+            torch.hub.set_dir(str(torch_hub_cache_dir))
+
             # Import required modules
             from pixal3d.pipelines import Pixal3DImageTo3DPipeline
             try:
@@ -154,9 +212,17 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
                 from pixal3d.modules.image_feature_extractor import DinoV3ProjFeatureExtractor
             import o_voxel
 
+            # When configured with a local absolute path, report an incomplete download clearly
+            # instead of letting the custom loader reinterpret that path as a Hugging Face repo ID.
+            if self.model_path.is_absolute() and not (self.model_path / "pipeline.json").is_file():
+                raise FileNotFoundError(
+                    f"Pixal3D checkpoint is missing pipeline.json at {self.model_path}. "
+                    "Download it with the project's model downloader before loading Pixal3D."
+                )
+
             # Initialize pipeline using from_pretrained
             logger.info("Initializing Pixal3D pipeline from pretrained...")
-            self.pipeline = Pixal3DImageTo3DPipeline.from_pretrained(self.model_path)
+            self.pipeline = Pixal3DImageTo3DPipeline.from_pretrained(str(self.model_path))
 
             # Build image conditioning models (same configs as in inference.py)
             logger.info("Building Pixal3D image conditioning models...")
@@ -188,6 +254,8 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
                     "naf_target_size": 1024,
                 },
             }
+            for config in image_cond_configs.values():
+                config["cache_dir"] = str(hf_cache_dir)
 
             self.pipeline.image_cond_model_ss = DinoV3ProjFeatureExtractor(
                 **image_cond_configs["ss"]
@@ -250,20 +318,60 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
                         reason=str(rp.get("reason", "scheduler resource plan")),
                     ),
                 )
-                sec_gpus = [g for g in self.gpu_ids if g != self.gpu_ids[0]] or list(self.gpu_ids)
-                cond_models = [
-                    self.pipeline.image_cond_model_ss,
-                    self.pipeline.image_cond_model_shape_512,
-                    self.pipeline.image_cond_model_shape_1024,
-                    self.pipeline.image_cond_model_tex_1024,
-                ]
-                for idx, cm in enumerate(cond_models):
-                    if cm is not None and hasattr(cm, "to"):
-                        target_dev = f"cuda:{sec_gpus[idx % len(sec_gpus)]}"
+                # Keep each projector beside the flow model that consumes its output.
+                # The custom pipeline moves conditioning tensors between stage devices,
+                # while its projection grid/camera tensors must share the encoder device.
+                condition_stages = (
+                    ("sparse_structure_flow_model", "image_cond_model_ss"),
+                    ("shape_slat_flow_model_512", "image_cond_model_shape_512"),
+                    ("shape_slat_flow_model_1024", "image_cond_model_shape_1024"),
+                    ("tex_slat_flow_model_1024", "image_cond_model_tex_1024"),
+                )
+                models_by_name = getattr(self.pipeline, "models", {})
+                for idx, (flow_name, cond_attr) in enumerate(condition_stages):
+                    cond_model = getattr(self.pipeline, cond_attr, None)
+                    if cond_model is None or not callable(getattr(cond_model, "to", None)):
+                        raise RuntimeError(
+                            f"Pixal3D condition model {cond_attr!r} was not initialized"
+                        )
+
+                    fallback_device = f"cuda:{self.gpu_ids[idx % len(self.gpu_ids)]}"
+                    flow_model = (
+                        models_by_name.get(flow_name)
+                        if isinstance(models_by_name, dict)
+                        else None
+                    )
+                    target_device = fallback_device
+                    if flow_model is not None and callable(getattr(flow_model, "parameters", None)):
                         try:
-                            cm.to(target_dev)
-                        except Exception as ex:
-                            logger.debug("Failed moving cond model %s to %s: %s", idx, target_dev, ex)
+                            target_device = str(next(flow_model.parameters()).device)
+                        except StopIteration:
+                            pass
+
+                    if target_device != "cuda" and not target_device.startswith("cuda:"):
+                        raise RuntimeError(
+                            f"Pixal3D flow stage {flow_name!r} was not dispatched to CUDA "
+                            f"(device={target_device})"
+                        )
+                    try:
+                        cond_model.to(target_device)
+                    except Exception as ex:
+                        logger.exception(
+                            "Failed placing Pixal3D condition model %s beside %s on %s",
+                            cond_attr,
+                            flow_name,
+                            target_device,
+                        )
+                        raise RuntimeError(
+                            f"Could not place Pixal3D condition model {cond_attr!r} "
+                            f"on flow stage device {target_device}"
+                        ) from ex
+                    logger.info(
+                        "Placed Pixal3D condition model %s beside %s on %s",
+                        cond_attr,
+                        flow_name,
+                        target_device,
+                    )
                 for attr in [
                     "image_cond_model_ss",
                     "image_cond_model_shape_512",
@@ -275,7 +383,8 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
                         try:
                             m._load_naf()
                         except Exception as e:
-                            logger.debug("Could not pre-load NAF upsampler: %s", e)
+                            logger.exception("Pixal3D required NAF upsampler failed to load")
+                            raise RuntimeError("Pixal3D failed to load a required NAF upsampler") from e
                 logger.info("Pixal3D pipeline dispatched across GPUs %s", self.gpu_ids)
             elif use_low_vram:
                 self.pipeline._device = torch.device(device)
@@ -291,7 +400,8 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
                         try:
                             m._load_naf()
                         except Exception as e:
-                            logger.debug("Could not load NAF on CPU: %s", e)
+                            logger.exception("Pixal3D required NAF upsampler failed to pre-load in low-VRAM mode")
+                            raise RuntimeError("Pixal3D failed to pre-load a required NAF upsampler") from e
                 logger.info("Pixal3D loaded in low-VRAM mode on %s (peak VRAM ~10-12GB)", device)
             else:
                 self.pipeline.low_vram = False
@@ -310,7 +420,8 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
                             try:
                                 m._load_naf()
                             except Exception as e:
-                                logger.debug("Could not load NAF: %s", e)
+                                logger.exception("Pixal3D required NAF upsampler failed to load")
+                                raise RuntimeError("Pixal3D failed to load a required NAF upsampler") from e
                 logger.info("Pixal3D loaded in standard mode on %s", device)
 
             logger.info("Pixal3D models loaded successfully")
@@ -345,65 +456,102 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
         self, image_path: str, manual_fov: Optional[float] = None
     ) -> Dict[str, float]:
         """Estimate camera parameters using MoGe or manual FOV."""
-        from pixal3d.inference import (
-            distance_from_fov,
-            get_camera_params_wild_moge,
-            load_moge_model,
-        )
+        try:
+            self._ensure_pixal3d_in_path()
+            distance_from_fov = None
+            get_camera_params_wild_moge = None
+            load_moge_model = None
+            try:
+                inference_module = _load_pixal3d_inference_module(self.pixal3d_root)
+                if inference_module is not None:
+                    distance_from_fov = getattr(inference_module, "distance_from_fov", None)
+                    get_camera_params_wild_moge = getattr(
+                        inference_module, "get_camera_params_wild_moge", None
+                    )
+                    load_moge_model = getattr(inference_module, "load_moge_model", None)
+            except Exception as helper_err:
+                logger.warning(
+                    "Unable to load camera helpers from the custom Pixal3D checkout: %s",
+                    helper_err,
+                )
 
-        if manual_fov is not None and manual_fov > 0:
-            logger.info(f"Using manual FOV: {math.degrees(manual_fov):.2f} deg")
-            camera_angle_x = float(manual_fov)
-            grid_point = torch.tensor([-1.0, 0.0, 0.0])
-            distance = distance_from_fov(
-                camera_angle_x,
-                grid_point,
-                torch.tensor([0 - 0, 512 - 1 + 0]),
-                1.0,
-                512,
-            )["distance_from_x"]
+            if manual_fov is not None and manual_fov > 0:
+                logger.info(f"Using manual FOV: {math.degrees(manual_fov):.2f} deg")
+                camera_angle_x = float(manual_fov)
+                if callable(distance_from_fov):
+                    try:
+                        grid_point = torch.tensor([-1.0, 0.0, 0.0])
+                        distance = distance_from_fov(
+                            camera_angle_x,
+                            grid_point,
+                            torch.tensor([0, 511]),
+                            1.0,
+                            512,
+                        )["distance_from_x"]
+                    except Exception:
+                        distance = 1.0 / (2.0 * math.tan(camera_angle_x / 2.0))
+                else:
+                    distance = 1.0 / (2.0 * math.tan(camera_angle_x / 2.0))
+                return {"camera_angle_x": camera_angle_x, "distance": distance, "mesh_scale": 1.0}
+
+            # Use MoGe for camera estimation with safe fallback
+            dev = self.device if hasattr(self, "device") and self.device else "cuda"
+            if callable(load_moge_model) and callable(get_camera_params_wild_moge):
+                try:
+                    logger.info("Loading MoGe model for camera estimation...")
+                    self.moge_model = load_moge_model(device=dev)
+
+                    logger.info("Estimating camera parameters...")
+                    camera_params = get_camera_params_wild_moge(
+                        image_path, self.moge_model, device=dev, mesh_scale=1.0, extend_pixel=0, image_resolution=512
+                    )
+
+                    # Free MoGe VRAM
+                    if hasattr(self.moge_model, "cpu"):
+                        self.moge_model.cpu()
+                    del self.moge_model
+                    self.moge_model = None
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    logger.info(
+                        f"Estimated camera: camera_angle_x={camera_params['camera_angle_x']:.4f}, "
+                        f"distance={camera_params['distance']:.4f}"
+                    )
+                    return camera_params
+                except Exception as moge_err:
+                    logger.warning("MoGe camera estimation failed (%s); falling back to default FOV (49.13°)", moge_err)
+                    if self.moge_model is not None:
+                        try:
+                            if hasattr(self.moge_model, "cpu"):
+                                self.moge_model.cpu()
+                            del self.moge_model
+                        except Exception:
+                            pass
+                        self.moge_model = None
+
+            # Fallback default FOV: ~49.13 degrees
+            camera_angle_x = 0.8575560450553894
+            if callable(distance_from_fov):
+                try:
+                    grid_point = torch.tensor([-1.0, 0.0, 0.0])
+                    distance = distance_from_fov(
+                        camera_angle_x,
+                        grid_point,
+                        torch.tensor([0, 511]),
+                        1.0,
+                        512,
+                    )["distance_from_x"]
+                except Exception:
+                    distance = 1.0 / (2.0 * math.tan(camera_angle_x / 2.0))
+            else:
+                distance = 1.0 / (2.0 * math.tan(camera_angle_x / 2.0))
             return {"camera_angle_x": camera_angle_x, "distance": distance, "mesh_scale": 1.0}
 
-        # Use MoGe for camera estimation with safe fallback
-        dev = self.device if hasattr(self, "device") and self.device else "cuda"
-        try:
-            logger.info("Loading MoGe model for camera estimation...")
-            self.moge_model = load_moge_model(device=dev)
-
-            logger.info("Estimating camera parameters...")
-            camera_params = get_camera_params_wild_moge(
-                image_path, self.moge_model, device=dev, mesh_scale=1.0, extend_pixel=0, image_resolution=512
-            )
-
-            # Free MoGe VRAM
-            self.moge_model.cpu()
-            del self.moge_model
-            self.moge_model = None
-            torch.cuda.empty_cache()
-
-            logger.info(
-                f"Estimated camera: camera_angle_x={camera_params['camera_angle_x']:.4f}, "
-                f"distance={camera_params['distance']:.4f}"
-            )
-            return camera_params
-        except Exception as moge_err:
-            logger.warning("MoGe camera estimation failed (%s); falling back to default FOV (49.13°)", moge_err)
-            if self.moge_model is not None:
-                try:
-                    self.moge_model.cpu()
-                    del self.moge_model
-                except Exception:
-                    pass
-                self.moge_model = None
+        except Exception as e:
+            logger.warning("Camera parameter estimation failed completely (%s); using default fallback", e)
             camera_angle_x = 0.8575560450553894
-            grid_point = torch.tensor([-1.0, 0.0, 0.0])
-            distance = distance_from_fov(
-                camera_angle_x,
-                grid_point,
-                torch.tensor([0, 511]),
-                1.0,
-                512,
-            )["distance_from_x"]
+            distance = 1.0 / (2.0 * math.tan(camera_angle_x / 2.0))
             return {"camera_angle_x": camera_angle_x, "distance": distance, "mesh_scale": 1.0}
 
     def _run_inference(
@@ -411,7 +559,7 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
         image: Image.Image,
         seed: int = 42,
         camera_params: Optional[Dict[str, float]] = None,
-    ) -> str:
+    ) -> Tuple[str, int]:
         """Run Pixal3D pipeline inference and return GLB path."""
         import o_voxel
 
@@ -421,8 +569,6 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
         # Keep model settings adapter-owned; seed and camera parameters remain caller-controlled.
         pipeline_type = _LOCKED_INFERENCE_PROFILE["pipeline_type"]
         max_num_tokens = _LOCKED_INFERENCE_PROFILE["max_num_tokens"]
-        resolution = _LOCKED_INFERENCE_PROFILE["resolution"]
-        low_vram = _LOCKED_INFERENCE_PROFILE["low_vram"]
         locked_samplers = _LOCKED_INFERENCE_PROFILE["sampler_overrides"]
         ss_override = deepcopy(locked_samplers["sparse_structure"])
         shape_override = deepcopy(locked_samplers["shape"])
@@ -441,11 +587,21 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
             tex_slat_sampler_params=tex_override,
             preprocess_image=False,
             pipeline_type=pipeline_type,
-            resolution=resolution,
             max_num_tokens=max_num_tokens,
         )
 
-        mesh = mesh_list[0]
+        if isinstance(mesh_list, (list, tuple)):
+            if not mesh_list:
+                raise RuntimeError("Pixal3D pipeline returned no meshes")
+            mesh = mesh_list[0]
+        else:
+            mesh = mesh_list
+
+        # Derive the actual voxel grid resolution from the custom pipeline result.
+        voxel_size = float(getattr(mesh, "voxel_size", 0.0))
+        if not math.isfinite(voxel_size) or voxel_size <= 0:
+            raise ValueError("Pixal3D pipeline output must expose a positive voxel_size")
+        grid_size = int(round(1.0 / voxel_size))
 
         # Extract GLB
         rot = np.array(
@@ -471,11 +627,11 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
             attr_volume=mesh.attrs,
             coords=mesh.coords,
             attr_layout=self.pipeline.pbr_attr_layout,
-            grid_size=resolution,
+            grid_size=grid_size,
             aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
             decimation_target=1000000,
             texture_size=4096,
-            remesh=True,
+            remesh=False,
             remesh_band=1,
             remesh_project=0,
             use_tqdm=True,
@@ -483,9 +639,9 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
 
         glb.apply_transform(rot)
         glb.export(output_path, extension_webp=True)
-        logger.info(f"Pixal3D GLB exported to: {output_path}")
+        logger.info("Pixal3D GLB exported to: %s (grid_size=%s)", output_path, grid_size)
 
-        return output_path
+        return output_path, grid_size
 
     def _process_request(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -525,7 +681,6 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
             seed = inputs.get("seed", 42)
             manual_fov = inputs.get("manual_fov", None)
             # EXPERIMENTAL_MAX_DETAIL default follows official Pixal3D standard mode. Ask user before later profile changes.
-            resolution = _LOCKED_INFERENCE_PROFILE["resolution"]
             pipeline_type = _LOCKED_INFERENCE_PROFILE["pipeline_type"]
             low_vram = _LOCKED_INFERENCE_PROFILE["low_vram"]
 
@@ -536,15 +691,45 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
             output_dir = self.path_generator.base_output_dir / "pixal3d" / f"{image_path.stem}_{uuid.uuid4().hex}"
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Load input image
-            input_image = Image.open(image_path)
+            # Load and preprocess the image using the custom vendored Pixal3D pipeline.
+            with Image.open(image_path) as source_image:
+                input_image = source_image.convert("RGBA")
             original_input_size = [int(input_image.width), int(input_image.height)]
 
-            # Estimate camera parameters
-            camera_params = self._estimate_camera_params(str(image_path), manual_fov)
+            try:
+                input_image = self.pipeline.preprocess_image(input_image)
+            except Exception as bg_err:
+                logger.warning(
+                    "Pixal3D image preprocessing failed (%s); using the source image as-is",
+                    bg_err,
+                )
+
+            # The custom inference entry point estimates camera parameters from this same
+            # cropped/preprocessed image, not from the unprocessed upload.
+            camera_image_path = output_dir / ("_camera_input_" + uuid.uuid4().hex + ".png")
+            try:
+                input_image.save(camera_image_path)
+                camera_params = self._estimate_camera_params(
+                    str(camera_image_path), manual_fov
+                )
+            finally:
+                camera_image_path.unlink(missing_ok=True)
+                try:
+                    output_dir.rmdir()
+                except OSError:
+                    pass
+
+            # Standardize model input to 512x512 without distorting the aspect ratio.
+            input_image = input_image.convert("RGBA")
+            target = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+            thumb = input_image.copy()
+            thumb.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            offset = ((512 - thumb.width) // 2, (512 - thumb.height) // 2)
+            target.paste(thumb, offset, mask=thumb.getchannel("A"))
+            input_image = target
 
             # Run Pixal3D pipeline
-            glb_path = self._run_inference(
+            glb_path, effective_geometry_resolution = self._run_inference(
                 input_image,
                 seed=seed,
                 camera_params=camera_params,
@@ -586,8 +771,8 @@ class Pixal3DImageToRawMeshAdapter(ImageToMeshModel):
                     "native_vertex_count": mesh_stats["vertex_count"],
                     "native_face_count": mesh_stats["face_count"],
                     "geometry_extractor": "Pixal3D image-to-3D with MoGe camera estimation",
-                    "effective_geometry_resolution": None,
-                    "geometry_resolution_source": "Pixal3D pipeline does not expose a scalar achieved grid resolution",
+                    "effective_geometry_resolution": effective_geometry_resolution,
+                    "geometry_resolution_source": "Inferred from custom Pixal3D MeshWithVoxel.voxel_size",
                     "mesh_operations": [],
                     "geometry_transforms": ["uniform scale", "axis orientation conversion"],
                     "original_input_size": original_input_size,

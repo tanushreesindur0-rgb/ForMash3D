@@ -1,4 +1,5 @@
 import ast
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -237,6 +238,19 @@ def test_auto_seeds_enabled_executes_planned_candidate_count():
     assert seed_plan["seed_schedule"] == [10, 15, 20]
 
 
+def test_explicit_single_candidate_count_wins_over_auto_seeds():
+    seed_plan = resolve_seed_plan(
+        {"candidate_count": 1, "plan": {"num_seeds": 3}},
+        {"seed": 10},
+        seeds_cfg={"base_seed": 41, "seed_step": 5, "max_candidates": 4},
+        apply_cfg={"auto_seeds": True},
+    )
+
+    assert seed_plan["candidate_count"] == 1
+    assert seed_plan["auto_candidates"] is False
+    assert seed_plan["seed_schedule"] == [10]
+
+
 def test_rate_limit_disabled_allows_arbitrary_requests():
     import asyncio
     from unittest.mock import MagicMock
@@ -290,6 +304,40 @@ def test_low_vram_mode_accepts_trellis2_when_free_vram_meets_low_threshold():
     assert plan["adapter"] == "trellis2_image_to_raw_mesh"
 
 
+def test_low_vram_false_rejects_trellis2_when_free_vram_is_below_full_24gb():
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 1,
+        "installed_adapters": ["trellis2_image_to_raw_mesh"],
+        "enabled_adapters": ["trellis2_image_to_raw_mesh"],
+        "free_vram_gb": 14.36,
+        "max_free_vram_gb": 14.36,
+        "aggregate_free_vram_gb": 14.36,
+    }
+    with pytest.raises(ValueError, match="requires 23.0 GB VRAM, but only 14.36 GB is free"):
+        plan_generation(
+            {"model_preference": "trellis2_image_to_raw_mesh", "auto_mode": False, "low_vram": False},
+            runtime,
+        )
+
+
+def test_low_vram_false_accepts_trellis2_when_free_vram_meets_full_24gb():
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 1,
+        "installed_adapters": ["trellis2_image_to_raw_mesh"],
+        "enabled_adapters": ["trellis2_image_to_raw_mesh"],
+        "free_vram_gb": 24.0,
+        "max_free_vram_gb": 24.0,
+        "aggregate_free_vram_gb": 24.0,
+    }
+    plan = plan_generation(
+        {"model_preference": "trellis2_image_to_raw_mesh", "auto_mode": False, "low_vram": False},
+        runtime,
+    )
+    assert plan["adapter"] == "trellis2_image_to_raw_mesh"
+
+
 def test_legacy_textured_mesh_model_preference_normalizes_to_raw_mesh():
     runtime = {
         "has_cuda": True,
@@ -332,6 +380,140 @@ def test_random_seed_dynamic_assignment_when_seed_unspecified():
 
     # Over 5 runs with range 10000..999999, seeds should not all be identical
     assert len(seeds) > 1
+
+
+def test_unloaded_model_rejected_when_free_vram_is_insufficient():
+    """When a model is not loaded and free VRAM is below requirements, it must be rejected."""
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 1,
+        "installed_adapters": ["trellis_image_to_raw_mesh"],
+        "enabled_adapters": ["trellis_image_to_raw_mesh"],
+        "free_vram_gb": 4.63,
+        "max_free_vram_gb": 4.63,
+        "aggregate_free_vram_gb": 4.63,
+        "loaded_models": [],
+    }
+    with pytest.raises(ValueError, match="requires 11.5 GB VRAM, but only 4.63 GB is free"):
+        plan_generation(
+            {"model_preference": "trellis_image_to_raw_mesh", "auto_mode": False},
+            runtime,
+        )
+
+
+def test_already_loaded_model_accepted_even_with_low_free_vram():
+    """When a model is already loaded in worker memory, it must not be rejected due to low free VRAM."""
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 1,
+        "installed_adapters": ["trellis_image_to_raw_mesh"],
+        "enabled_adapters": ["trellis_image_to_raw_mesh"],
+        "free_vram_gb": 4.63,
+        "max_free_vram_gb": 4.63,
+        "aggregate_free_vram_gb": 4.63,
+        "loaded_models": ["trellis_image_to_raw_mesh"],
+    }
+    plan = plan_generation(
+        {"model_preference": "trellis_image_to_raw_mesh", "auto_mode": False},
+        runtime,
+    )
+    assert plan["adapter"] == "trellis_image_to_raw_mesh"
+    assert any("already loaded in worker memory" in r for r in plan["reasons"])
+
+
+def test_already_loaded_model_with_legacy_alias_accepted_when_vram_is_low():
+    """Legacy alias request succeeds when the canonical model is already loaded."""
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 1,
+        "installed_adapters": ["trellis_image_to_raw_mesh", "trellis_image_to_textured_mesh"],
+        "enabled_adapters": ["trellis_image_to_raw_mesh", "trellis_image_to_textured_mesh"],
+        "free_vram_gb": 4.63,
+        "max_free_vram_gb": 4.63,
+        "aggregate_free_vram_gb": 4.63,
+        "loaded_models": ["trellis_image_to_raw_mesh"],
+    }
+    plan = plan_generation(
+        {"model_preference": "trellis_image_to_textured_mesh", "auto_mode": False},
+        runtime,
+    )
+    assert plan["adapter"] == "trellis_image_to_raw_mesh"
+    assert any("already loaded in worker memory" in r for r in plan["reasons"])
+
+
+def test_scheduler_get_loaded_models_and_router_extraction():
+    """Verify scheduler reporting of loaded models and router helper extraction."""
+    from core.scheduler.multiprocess_scheduler import MultiprocessModelScheduler
+    from api.routers.mesh_generation import _get_loaded_models_from_scheduler
+
+    scheduler = MultiprocessModelScheduler.__new__(MultiprocessModelScheduler)
+    scheduler.worker_assignments = {
+        "trellis_image_to_raw_mesh": ["worker_1"],
+    }
+    scheduler.workers = {}
+    scheduler.worker_configs = {}
+
+    loaded = scheduler.get_loaded_models()
+    assert "trellis_image_to_raw_mesh" in loaded
+
+    router_loaded = _get_loaded_models_from_scheduler(scheduler)
+    assert "trellis_image_to_raw_mesh" in router_loaded
+
+
+def test_already_loaded_model_accepted_even_with_low_vram_false():
+    """Even if low_vram is explicitly False and free VRAM is below requirements, resident model is accepted."""
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 1,
+        "installed_adapters": ["trellis_image_to_raw_mesh"],
+        "enabled_adapters": ["trellis_image_to_raw_mesh"],
+        "free_vram_gb": 4.63,
+        "max_free_vram_gb": 4.63,
+        "aggregate_free_vram_gb": 4.63,
+        "loaded_models": ["trellis_image_to_raw_mesh"],
+    }
+    plan = plan_generation(
+        {
+            "model_preference": "trellis_image_to_raw_mesh",
+            "auto_mode": False,
+            "low_vram": False,
+        },
+        runtime,
+    )
+    assert plan["adapter"] == "trellis_image_to_raw_mesh"
+    assert any("already loaded in worker memory" in r for r in plan["reasons"])
+
+
+def test_auto_mode_selects_already_loaded_candidate_when_free_vram_is_constrained():
+    """In auto mode with low free VRAM, candidate already loaded in worker memory is selected."""
+    runtime = {
+        "has_cuda": True,
+        "gpu_count": 1,
+        "installed_adapters": [
+            "trellis2_image_to_raw_mesh",
+            "hunyuan3d_shape_v21_image_to_raw_mesh",
+        ],
+        "enabled_adapters": [
+            "trellis2_image_to_raw_mesh",
+            "hunyuan3d_shape_v21_image_to_raw_mesh",
+        ],
+        "free_vram_gb": 4.63,
+        "max_free_vram_gb": 4.63,
+        "aggregate_free_vram_gb": 4.63,
+        "loaded_models": ["hunyuan3d_shape_v21_image_to_raw_mesh"],
+    }
+    # balanced quality routes candidates: trellis2 first, then hunyuan3d
+    plan = plan_generation(
+        {
+            "mesh_style": "auto",
+            "requested_quality": "balanced",
+            "object_type": "general",
+            "auto_mode": True,
+        },
+        runtime,
+    )
+    assert plan["adapter"] == "hunyuan3d_shape_v21_image_to_raw_mesh"
+    assert any("already loaded in worker memory" in r for r in plan["reasons"])
 
 
 

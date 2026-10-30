@@ -1,4 +1,4 @@
-# ForMash 3D — Complete API Documentation
+# ForMesh 3D — Complete API Documentation
 
 > **Version**: 0.1.0
 > **Base URL**: `http://localhost:7842` (Backend API)
@@ -29,7 +29,7 @@
 
 ## Overview
 
-The ForMash 3D REST API follows RESTful conventions and returns JSON responses. All endpoints are prefixed with `/api/v1`.
+The ForMesh 3D REST API follows RESTful conventions and returns JSON responses. All endpoints are prefixed with `/api/v1`.
 
 ### Standard Response Format
 
@@ -87,6 +87,28 @@ Rate limiting is controlled by `security.rate_limit_enabled` and `security.rate_
 ---
 
 ## System APIs
+
+### Live Log Stream (SSE)
+
+```http
+GET /api/v1/system/logs/stream?file=master.log&tail=<N>
+Accept: text/event-stream
+```
+
+The Admin Logs tab consumes this endpoint as raw UTF-8 text. On a fresh connection, `tail` selects recent lines and is clamped to the configured range; omitting it uses `logging.stream.default_tail_lines` from `backend/config/system.yaml`. `tail=0` seeks to EOF and only follows new writes. The initial seek scans backward up to `logging.stream.max_tail_scan_bytes`, so normal first-paint cost does not depend on older file history.
+
+Query parameters:
+
+- `file` (string, default `master.log`): a strict allowlisted `.log` basename inside the repository `logs/` directory. Missing or invalid files return `404`.
+- `tail` (integer, optional): initial line count; bounded by `logging.stream.max_tail_lines`. Applied only to a fresh connection.
+- `offset` (integer, optional): byte offset used when starting or resuming explicitly.
+- `identity` (string, optional): file identity paired with `offset` to detect replacement.
+- `Last-Event-ID` (request header): automatically sent by `EventSource` on reconnect and takes precedence over query offsets.
+
+Each message carries a JSON payload with `identity`, the next byte `offset`, and unmodified `chunk` text. SSE event IDs retain the `device:inode:offset` form. A named `reset` event tells the client to clear its view after truncation or replacement; the client then resumes from the new file identity. Partial lines, CR/CRLF progress output, blank lines and Unicode are not parsed into records.
+
+The transport is SSE-only and uses the non-buffering Next.js proxy. The legacy WebSocket transport is not exposed. Existing `GET /api/v1/system/logs/files`, `GET /api/v1/system/logs/files/{filename}?lines=...`, and `DELETE /api/v1/system/logs/files/master.log` endpoints remain available; Clear truncates the active file in place.
+
 
 ### Health Check
 
@@ -657,6 +679,8 @@ GET /api/v1/system/models
 
 Only models with `enabled: true` in `backend/config/models.yaml` are listed; `taoflowforge_image_to_raw_mesh` is registered but disabled. `GET /api/v1/system/models?feature=<feature>` narrows the response to one feature, and `GET /api/v1/system/features` lists the supported features with their model counts.
 
+> **Important:** this endpoint is a manifest/catalog view. An entry in `available_models` or a positive weights indicator is not proof that all runtime dependencies are importable, the full checkpoint can load, the model fits the current GPU, or the produced geometry passes quality checks. Some model pipelines are reported to fail during initialization/loading; some others can return broken geometry. See [MODEL-STATUS.md](MODEL-STATUS.md) before treating a catalog entry as production-ready.
+
 ### Production generation controls
 
 The image-to-raw and image-to-textured generation contracts accept the same production controls used by the workspace:
@@ -754,7 +778,7 @@ Content-Type: application/json
 
 ### Generate Motion (ARDY)
 
-Synthesize kinematically valid 3D human motion from a natural language text prompt using ARDY. Produces browser-playable `motion.json` format for Three.js. ForMash3D runs ARDY and its local LLM2Vec text encoder in CPU-only mode; no GPU VRAM is reserved, and inference is slower and bounded by host CPU/RAM.
+Synthesize kinematically valid 3D human motion from a natural language text prompt using ARDY. Produces browser-playable `motion.json` format for Three.js. ForMesh3D runs ARDY and its local LLM2Vec text encoder in CPU-only mode; no GPU VRAM is reserved, and inference is slower and bounded by host CPU/RAM.
 
 ```http
 POST /api/v1/motion-generation/generate-motion

@@ -699,6 +699,25 @@ class ApiClient {
     return response.data;
   }
 
+  // Mesh Refinement Endpoints (Hi3D)
+  async refineMesh(request: {
+    jobId: string;
+    meshPath: string;
+    imagePath?: string;
+    resolution?: number;
+  }): Promise<{ refinement_job_id: string; status: string }> {
+    const response = await this.client.post<{ refinement_job_id: string; status: string }>(
+      '/api/v1/mesh-generation/refine-mesh',
+      {
+        job_id: request.jobId,
+        mesh_path: request.meshPath,
+        ...(request.imagePath !== undefined ? { image_path: request.imagePath } : {}),
+        ...(request.resolution !== undefined ? { resolution: request.resolution } : {}),
+      }
+    );
+    return response.data;
+  }
+
   // Motion Generation Endpoints (ARDY)
   async generateMotion(request: MotionGenerationRequest): Promise<BaseApiResponse> {
     const response = await this.client.post<BaseApiResponse>(
@@ -753,24 +772,6 @@ class ApiClient {
     await this.client.delete('/api/v1/system/logs/files/master.log');
   }
 
-  streamLogs(onEntry: (log: any) => void, lastN: number = 100): () => void {
-    return this.streamEvents(
-      `/api/v1/system/logs/stream?last_n=${lastN}`,
-      (raw: any) => {
-        const d = raw as Record<string, unknown>;
-        if (d.level === 'HEARTBEAT' && !d.message) return;
-        const entry = {
-          id: String(d.id ?? `log-${Date.now()}-${Math.random().toString(36).slice(2)}`),
-          timestamp: String(d.timestamp || d.ts || new Date().toISOString()),
-          level: (String(d.level || 'info').toLowerCase()).replace(/[^a-z]/g, '') || 'info',
-          source: String(d.source || d.logger || 'system'),
-          message: String(d.message || ''),
-        };
-        onEntry(entry);
-      }
-    );
-  }
-
   async listModels(): Promise<ModelRuntimeDetails[]> {
     try {
       const response = await this.client.get<AvailableModels>('/api/v1/system/models');
@@ -780,48 +781,6 @@ class ApiClient {
     } catch {
       return [];
     }
-  }
-
-  // SSE streaming helper
-  streamEvents(path: string, onEvent: (data: unknown) => void, onDone?: () => void): () => void {
-    let es: EventSource | null = null;
-    let isClosed = false;
-
-    try {
-      const url = path.startsWith('/') ? path : `/${path}`;
-      es = new EventSource(url);
-
-      es.onmessage = (e) => {
-        if (isClosed) return;
-        try {
-          onEvent(JSON.parse(e.data));
-        } catch {
-          // Ignore JSON parse errors
-        }
-      };
-
-      es.onerror = () => {
-        if (isClosed) return;
-        if (es && es.readyState === EventSource.CLOSED) {
-          isClosed = true;
-          es.close();
-          es = null;
-          onDone?.();
-        }
-      };
-    } catch (err) {
-      isClosed = true;
-      onDone?.();
-      console.error('Failed to create EventSource:', err);
-    }
-
-    return () => {
-      if (!isClosed && es) {
-        isClosed = true;
-        es.close();
-        es = null;
-      }
-    };
   }
 
   // Utility methods

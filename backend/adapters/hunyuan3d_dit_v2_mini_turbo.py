@@ -2,7 +2,7 @@
 Hunyuan3D-DiT-v2-mini-Turbo model adapter for low-VRAM image-to-mesh generation.
 
 This adapter integrates the Hunyuan3D-DiT-v2-mini-Turbo (0.6B) model into
-the ForMash3D mesh generation framework, supporting low-resource shape generation.
+the ForMesh3D mesh generation framework, supporting low-resource shape generation.
 """
 
 import logging
@@ -357,14 +357,30 @@ class Hunyuan3DDiTV2MiniTurboImageToRawMeshAdapter(ImageToMeshModel):
             seed = int(inputs.get("seed", 42))
             generator = torch.Generator(device=self.device).manual_seed(seed)
 
-            configure_native_dense_decoder(self.pipeline, "Hunyuan3D-DiT-v2-mini-Turbo")
+            algo = inputs.get("mc_algo", "mc")
+            # diso/DMC requires CUDA arch >= 8.0 (Ampere+). Only enable on SM >= 8.
+            _dmc_allowed = False
+            try:
+                import diso
+                if torch.cuda.is_available():
+                    cap = torch.cuda.get_device_capability(
+                        int(str(self.device).split(":")[-1]) if ":" in str(self.device) else 0
+                    )
+                    _dmc_allowed = (cap[0] >= 8)
+            except Exception:
+                pass
+            if _dmc_allowed:
+                algo = "dmc"
+            else:
+                algo = "mc"
+            configure_native_dense_decoder(self.pipeline, "Hunyuan3D-DiT-v2-mini-Turbo", mc_algo=algo)
             mesh_result = self.pipeline(
                 image=image,
                 octree_resolution=octree_res,
                 num_inference_steps=num_steps,
                 guidance_scale=guidance_scale,
                 num_chunks=num_chunks,
-                mc_algo=inputs["mc_algo"],
+                mc_algo=algo,
                 generator=generator,
             )[0]
 

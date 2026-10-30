@@ -107,7 +107,7 @@ export function buildGenerationParameters(
 
   const isTextured = textureEnabled;
 
-  // Runtime model parameters: only supported adapter inputs (such as seed) are passed.
+  // Runtime model parameters: only caller-controlled seed reaches adapters.
   // Numeric inference profiles (steps, guidance, octree resolution, samplers) live in adapters.
   const modelParameters: Record<string, unknown> = {};
   if (typeof settings.seed === 'number' && Number.isSafeInteger(settings.seed) && settings.seed >= 0) {

@@ -19,7 +19,7 @@ export type ToolType =
 export interface ActiveTask {
   id: string;
   isLocal?: boolean;
-  type: 'image-to-3d' | 'segment' | 'remesh' | 'texture' | 'animation' | 'rigging' | 'uv' | 'edit';
+  type: 'image-to-3d' | 'segment' | 'remesh' | 'texture' | 'animation' | 'rigging' | 'uv' | 'edit' | 'refine';
   title: string;
   inputImage?: string;
   inputImageName?: string;
@@ -440,10 +440,6 @@ export interface TextureSettings {
     ao: boolean;
     height: boolean;
   };
-  lowVram?: boolean;
-  maxNumView?: number;
-  generatePBR?: boolean;
-  quadCompatibleUv?: boolean;
 }
 
 export interface AutoOptimizeSettings {
@@ -545,4 +541,3 @@ export interface PaintBrushSettings {
   shape: 'round' | 'square' | 'spray' | 'chalk';
   blendMode: string;
 }
-
