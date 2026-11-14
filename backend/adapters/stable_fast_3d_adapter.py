@@ -253,7 +253,13 @@ class StableFast3DAdapter(BaseModel):
                 "SF3D seed, texture_resolution, native_target_polycount, and target_vertex_count must be integers"
             ) from exc
 
-        remesh_option = str(inputs.get("remesh_option", "none") or "none").strip().lower()
+        explicit_remesh = inputs.get("remesh_option")
+        if explicit_remesh is not None:
+            remesh_option = str(explicit_remesh).strip().lower()
+        elif target_vertex_count > 0:
+            remesh_option = "triangle"
+        else:
+            remesh_option = "none"
         texture_enabled = bool(
             inputs.get("texture_enabled", True) and inputs.get("generate_texture", True)
         )
@@ -404,17 +410,6 @@ class StableFast3DAdapter(BaseModel):
         if not texture_enabled:
             import trimesh
             mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh)
-
-        # Direct polycount refinement: if user requested target polycount higher than
-        # native extracted triangles, apply direct subdivision to reach target density
-        if native_target_polycount > 0 and len(mesh.faces) > 0 and native_target_polycount > len(mesh.faces):
-            target_faces = min(600_000, native_target_polycount)
-            while len(mesh.faces) < target_faces:
-                if len(mesh.faces) * 2 > target_faces and len(mesh.faces) >= (target_faces * 0.7):
-                    break
-                mesh = mesh.subdivide()
-                if len(mesh.faces) >= target_faces:
-                    break
 
         vertices = getattr(mesh, "vertices", None)
         faces = getattr(mesh, "faces", None)
